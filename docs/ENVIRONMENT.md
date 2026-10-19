@@ -40,6 +40,9 @@ description is accurate. Keep this file honest by hand.
 |---|---|---|---|
 | `STELLAR_RPC_URL` | Required unless `STELLAR_RPC_URLS` set | — | Single Soroban RPC endpoint. |
 | `STELLAR_RPC_URLS` | Optional | — | Prioritised, comma-separated RPC endpoints for failover; overrides `STELLAR_RPC_URL` (which stays valid as a single-value alias). |
+| `INDEXER_STALL_THRESHOLD_SECONDS` | Optional | `max(60, 5 x POLL_INTERVAL_CEILING_MS)` | Seconds since the last poll after which `GET /v1/stats/indexer` reports `stalled` (issue #759). Go API; set `POLL_INTERVAL_CEILING_MS` on the API to match the indexer. |
+| `INDEXER_LAG_THRESHOLD_LEDGERS` | Optional | `max(10, ceil(ceiling / LEDGER_CLOSE_SECONDS) + 10)` | Ledger lag above which the status is `lagging`. |
+| `LEDGER_CLOSE_SECONDS` | Optional | `5.5` | Average ledger close time, used for the lag-seconds fallback when `ledger_metadata` has no timestamp for the last indexed ledger. |
 | `NETWORK` | Optional | `testnet` | One of `mainnet` \| `testnet` \| `futurenet`. |
 | `NETWORK_PASSPHRASE` | Required for non-standard networks | inferred for testnet/mainnet/pubnet | Stellar network passphrase, used to derive SAC contract ids for `TRACKED_SAC_ASSETS`. |
 | `POLL_INTERVAL_MS` | Optional | `1000` (min `100`, max `60000`) | Ledger poll interval. |
@@ -119,6 +122,10 @@ description is accurate. Keep this file honest by hand.
 | `REDIS_STREAM_KEY` | Optional | `trident:events` | Redis stream key used for event pub/sub and webhook consumption; must match the indexer's stream. |
 | `WEBHOOK_CONSUMER_GROUP` | Optional | `trident-webhooks` | Redis Stream consumer-group name for the webhook delivery worker. |
 | `WEBHOOK_CONSUMER_NAME` | Optional | `webhook-worker` | Redis Stream consumer name for the webhook delivery worker. |
+| `WEBHOOK_DELIVERY_WORKERS` | Optional | `16` | Size of the delivery worker pool. Deliveries are queued in the `webhook_outbox` table and delivered independently per subscription (issue #747). |
+| `WEBHOOK_RETRY_BASE_SECONDS` | Optional | `10` | First retry delay; doubles on each failed attempt (issue #748). |
+| `WEBHOOK_RETRY_MAX_BACKOFF_SECONDS` | Optional | `3600` | Cap on the delay between retries. |
+| `WEBHOOK_RETRY_WINDOW_HOURS` | Optional | `24` | How long after a delivery is queued it is retried before being dead-lettered. |
 | `RATE_LIMIT_FREE_RPS` | Optional | `10` | Requests/sec limit, free tier. |
 | `RATE_LIMIT_PRO_RPS` | Optional | `100` | Requests/sec limit, pro/standard tier. |
 | `RATE_LIMIT_INTERNAL_RPS` | Optional | `1000` | Requests/sec limit, internal tier. |
@@ -128,7 +135,7 @@ description is accurate. Keep this file honest by hand.
 | `TRUSTED_PROXY_ENABLED` | Optional | `false` | **Security-sensitive.** When `true`, the per-IP limiter attributes requests to the last hop in `X-Forwarded-For` instead of the TCP peer. Only enable when the API sits behind a proxy that *appends* to XFF (as `docker/nginx/nginx.conf` does) and is not directly reachable. Enabling it on a directly-reachable API lets any client forge its own source IP and bypass per-IP limiting. |
 | `RETENTION_AUDIT_LOG_DAYS` | Optional | `90` | Days to retain audit log rows. |
 | `RETENTION_PARSE_ERRORS_DAYS` | Optional | `30` | Days to retain parse-error rows. |
-| `RETENTION_WEBHOOK_DELIVERIES_DAYS` | Optional | `30` | Days to retain webhook delivery records. |
+| `RETENTION_WEBHOOK_DELIVERIES_DAYS` | Optional | `30` | Days to retain webhook delivery records, including dead letters. This is the only webhook cleanup; there is no separate hardcoded window. |
 | `RETENTION_SOROBAN_EVENTS_DAYS` | Optional | `0` (disabled) | Days to retain Soroban events; `0` disables pruning. |
 | `PPROF_ENABLED` | Optional | `false` | Enables the internal-only pprof profiling server. Never exposed publicly — bind it to loopback/localhost only. |
 | `PPROF_ADDR` | Optional | `127.0.0.1:6060` | Bind address for the pprof server, when enabled. |

@@ -397,16 +397,25 @@ export interface components {
             status: "ok";
         };
         ReadyChecks: {
-            /** @description "ok" or "error: <message>" */
-            postgres: string;
-            /** @description "ok" or "error: <message>" */
-            redis: string;
-            /** @description "ok" or "error: <message>" */
-            grpc_api: string;
+            /**
+             * @description Required dependency. "unavailable" fails readiness.
+             * @enum {string}
+             */
+            postgres: "ok" | "unavailable";
+            /**
+             * @description Optional dependency (middlewares fail open). "degraded" does not fail readiness.
+             * @enum {string}
+             */
+            redis: "ok" | "degraded";
+            /**
+             * @description Required dependency. "unavailable" fails readiness.
+             * @enum {string}
+             */
+            grpc_api: "ok" | "unavailable";
         };
         ReadyResponse: {
             /**
-             * @description "degraded" when any dependency check in `checks` failed.
+             * @description "degraded" when any dependency check in `checks` failed. The HTTP status is 503 only when a required dependency failed.
              * @enum {string}
              */
             status: "ok" | "degraded";
@@ -758,7 +767,7 @@ export interface operations {
                 };
             };
             429: components["responses"]["TooManyRequestsIPOnly"];
-            /** @description Either one or more dependencies is unreachable (ReadyResponse body, status "degraded", the failing entry in checks set to "error: ..."), or the server is shedding load under the global concurrency cap (ErrorResponse body, Retry-After header set) — the same outermost load-shedding behavior every endpoint shares. */
+            /** @description Postgres or the gRPC backend is unavailable (ReadyResponse body, status "degraded", the failing entry in checks set to "unavailable"), or the server is shedding load under the global concurrency cap (ErrorResponse body, Retry-After header set) — the same outermost load-shedding behavior every endpoint shares. */
             503: {
                 headers: {
                     "Retry-After": components["headers"]["Retry-After"];

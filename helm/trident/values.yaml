@@ -205,15 +205,18 @@ goApi:
   # the gRPC backend concurrently with a 3s-per-dependency timeout in the
   # handler (services/api/handlers/health.go) — timeoutSeconds here must
   # exceed that, or the probe itself times out before a legitimately slow
-  # (but healthy) dependency check can complete.
+  # (but healthy) dependency check can complete. Only Postgres and the gRPC
+  # backend fail readiness; a Redis failure is reported as "degraded" with a
+  # 200 (issue #758), so a Redis blip does not empty the Service.
   readinessProbe:
     httpGet:
       path: /v1/ready
       port: 3000
     initialDelaySeconds: 5
     periodSeconds: 5
-    # Stricter than liveness — pod is removed from rotation faster
-    failureThreshold: 1
+    # Tolerate transient Postgres/gRPC blips: 3 consecutive failures at a 5s
+    # period (~15s) before the pod leaves rotation.
+    failureThreshold: 3
     timeoutSeconds: 4
   # Grace period must be >= the bounded shutdown window in main.go so SIGTERM
   # drains in-flight requests before K8s force-kills the pod (issue #233).

@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0025) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0026) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -253,6 +253,21 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
     updated_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
     PRIMARY KEY (api_key_id, period_start)
 );
+
+-- Durable per-subscription webhook delivery queue (migration 0026).
+CREATE TABLE IF NOT EXISTS webhook_outbox (
+    id              BIGSERIAL   PRIMARY KEY,
+    subscription_id UUID        NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
+    event_id        TEXT        NOT NULL,
+    event           JSONB       NOT NULL,
+    attempt         INT         NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    locked_until    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_webhook_outbox_subscription_event UNIQUE (subscription_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox (next_attempt_at);
 
 CREATE INDEX IF NOT EXISTS idx_usage_rollup_key_period ON usage_rollup (api_key_id, period_start DESC);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_delivered_at ON webhook_deliveries (delivered_at);

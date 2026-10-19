@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -108,75 +107,17 @@ func TestDeliverWebhookSendsTimestampAndSignedPayload(t *testing.T) {
 	}
 }
 
-func TestDeliverWebhookRetrySucceedsAfterTransientFailures(t *testing.T) {
-	var callCount atomic.Int32
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := callCount.Add(1)
-		if n < 3 {
-			// Fail the first two attempts.
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	sub := webhookSubscription{
-		ID:        "sub-retry",
-		Secret:    "s3cr3t",
-		TargetURL: server.URL,
-	}
-	event := webhookEvent{ID: "evt-retry", ContractID: "C1", Network: "testnet"}
-
-	err := deliverSubscriptionWithRetry(context.Background(), nil, sub, event)
-	if err != nil {
-		t.Fatalf("expected eventual success, got err: %v", err)
-	}
-	if got := int(callCount.Load()); got != 3 {
-		t.Fatalf("expected 3 HTTP calls (2 failures + 1 success), got %d", got)
-	}
-}
-
-func TestDeliverWebhookDeadLetterAfterMaxAttempts(t *testing.T) {
-	// Capture the log output to verify the dead-letter warning is emitted.
-	var callCount atomic.Int32
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount.Add(1)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	sub := webhookSubscription{
-		ID:        "sub-dlq",
-		Secret:    "s3cr3t",
-		TargetURL: server.URL,
-	}
-	event := webhookEvent{ID: "evt-dlq", ContractID: "C1", Network: "testnet"}
-
-	err := deliverSubscriptionWithRetry(context.Background(), nil, sub, event)
-	// After max attempts an error should be returned.
-	if err == nil {
-		t.Fatal("expected error after exhausting retries, got nil")
-	}
-	if got := int(callCount.Load()); got != maxWebhookAttempts {
-		t.Fatalf("expected %d HTTP calls, got %d", maxWebhookAttempts, got)
-	}
-}
-
-func TestDeliverWebhookDeadLetterOnNetworkError(t *testing.T) {
-	// Point to a server that never responds.
+func TestPerformWebhookDeliveryReportsNetworkError(t *testing.T) {
 	sub := webhookSubscription{
 		ID:        "sub-net-dlq",
 		Secret:    "s3cr3t",
-		TargetURL: "http://127.0.0.1:0", // immediately refused
+		TargetURL: "http://127.0.0.1:0",
 	}
 	event := webhookEvent{ID: "evt-net-dlq", ContractID: "C1", Network: "testnet"}
 
-	err := deliverSubscriptionWithRetry(context.Background(), nil, sub, event)
-	if err == nil {
-		t.Fatal("expected error for unreachable endpoint")
+	result := performWebhookDelivery(context.Background(), sub, event)
+	if result.Success || result.Err == nil {
+		t.Fatal("expected failure with error for unreachable endpoint")
 	}
 }
 

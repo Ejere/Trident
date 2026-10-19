@@ -1,0 +1,58 @@
+---
+title: "Webhooks"
+description: "How Trident delivers events to your endpoint: signing, retries, dead letters, and retention."
+---
+
+Trident POSTs a signed JSON payload to your `targetUrl` for every event that matches a subscription (contract, optional `topic0`, network).
+
+## Delivery model
+
+Each matching event is queued once per subscription and delivered independently. A slow or failing endpoint only delays its own deliveries; other subscribers are not affected. Queued deliveries and their retry state are stored in Postgres, so they survive API restarts.
+
+A delivery succeeds when your endpoint returns any `2xx` status within 5 seconds. Anything else (non-2xx, timeout, connection error) is a failed attempt and is retried.
+
+## Verifying signatures
+
+Each request carries `X-Trident-Timestamp` (Unix seconds) and `X-Trident-Signature` (`sha256=` plus the hex HMAC-SHA256 of `"<timestamp>.<body>"`, keyed with the subscription secret). Reject requests with an old timestamp to prevent replays.
+
+## Retry schedule
+
+Failed deliveries are retried with capped exponential backoff and ±20% jitter:
+
+```
+delay(n) = min(WEBHOOK_RETRY_MAX_BACKOFF_SECONDS, WEBHOOK_RETRY_BASE_SECONDS × 2^(n-1)) × random(0.8, 1.2)
+```
+
+where `n` is the number of failed attempts so far. With the defaults (base 10 s, cap 1 h):
+
+| Failed attempt | Wait before the next attempt (before jitter) |
+|---|---|
+| 1 | 10 s |
+| 2 | 20 s |
+| 3 | 40 s |
+| 4 | 1 min 20 s |
+| 5 | 2 min 40 s |
+| 6 | 5 min 20 s |
+| 7 | 10 min 40 s |
+| 8 | 21 min 20 s |
+| 9 | 42 min 40 s |
+| 10 and later | 1 h |
+
+Retries continue for `WEBHOOK_RETRY_WINDOW_HOURS` (default 24) after the delivery was queued, roughly 30 attempts with the defaults. After the last attempt fails, the delivery is **dead-lettered**.
+
+Because retries are persisted, a restart of the API does not reset or lose them. Deliveries are at-least-once: a delivery can be repeated, for example if your endpoint responds after the 5 s timeout. Deduplicate on `event.id`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WEBHOOK_RETRY_BASE_SECONDS` | `10` | First retry delay |
+| `WEBHOOK_RETRY_MAX_BACKOFF_SECONDS` | `3600` | Cap on any retry delay |
+| `WEBHOOK_RETRY_WINDOW_HOURS` | `24` | Total time a delivery is retried |
+| `WEBHOOK_DELIVERY_WORKERS` | `16` | Concurrent deliveries |
+
+Pausing a subscription stops new events from being queued for it and holds already queued deliveries until it is resumed.
+
+## Dead letters and retention
+
+Every attempt is recorded and visible at `GET /v1/webhooks/{id}/deliveries`. Dead-lettered deliveries are listed at `GET /v1/webhooks/{id}/dead-letters` and can be replayed with `POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay`.
+
+Delivery records, including dead letters, are kept for `RETENTION_WEBHOOK_DELIVERIES_DAYS` (default 30) and then deleted. That setting is the only cleanup applied to this table.

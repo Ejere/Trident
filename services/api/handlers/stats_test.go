@@ -23,6 +23,7 @@ type mockStatsDB struct {
 	eventsLast  *int64
 	pollMs      *int64
 	lastPollAt  *time.Time
+	lastLedgerT *time.Time
 	scanErr     error
 }
 
@@ -44,14 +45,15 @@ func (r *mockStatsRow) Scan(dest ...any) error {
 	if r.m.scanErr != nil {
 		return r.m.scanErr
 	}
-	if len(dest) != 5 {
-		return fmt.Errorf("expected 5 dest, got %d", len(dest))
+	if len(dest) != 6 {
+		return fmt.Errorf("expected 6 dest, got %d", len(dest))
 	}
 	*dest[0].(**int64) = r.m.lastLedger
 	*dest[1].(**int64) = r.m.eventsTotal
 	*dest[2].(**int64) = r.m.eventsLast
 	*dest[3].(**int64) = r.m.pollMs
 	*dest[4].(**time.Time) = r.m.lastPollAt
+	*dest[5].(**time.Time) = r.m.lastLedgerT
 	return nil
 }
 
@@ -339,5 +341,90 @@ func TestContractStatsRollup_MatchesLiveAggregation(t *testing.T) {
 	}
 	if rollupRow.EventCount != 3 {
 		t.Errorf("expected 3 seeded events, got event_count=%d", rollupRow.EventCount)
+	}
+}
+
+func TestLoadIndexerThresholds_Defaults(t *testing.T) {
+	th := loadIndexerThresholds()
+	if th.Stall != 60*time.Second {
+		t.Errorf("stall: want 60s, got %v", th.Stall)
+	}
+	if th.LagLedgers != 11 {
+		t.Errorf("lag ledgers: want 11, got %d", th.LagLedgers)
+	}
+	if th.AvgLedgerCloseSeconds != 5.5 {
+		t.Errorf("close seconds: want 5.5, got %v", th.AvgLedgerCloseSeconds)
+	}
+}
+
+func TestLoadIndexerThresholds_DerivedFromCeiling(t *testing.T) {
+	t.Setenv("POLL_INTERVAL_CEILING_MS", "600000")
+	th := loadIndexerThresholds()
+	if th.Stall != 3000*time.Second {
+		t.Errorf("stall: want 3000s (5 x ceiling), got %v", th.Stall)
+	}
+	if th.LagLedgers != 120 {
+		t.Errorf("lag ledgers: want 120 (ceil(600/5.5)+10), got %d", th.LagLedgers)
+	}
+}
+
+func TestLoadIndexerThresholds_ExplicitOverrides(t *testing.T) {
+	t.Setenv("POLL_INTERVAL_CEILING_MS", "600000")
+	t.Setenv("INDEXER_STALL_THRESHOLD_SECONDS", "120")
+	t.Setenv("INDEXER_LAG_THRESHOLD_LEDGERS", "50")
+	t.Setenv("LEDGER_CLOSE_SECONDS", "6")
+	th := loadIndexerThresholds()
+	if th.Stall != 120*time.Second || th.LagLedgers != 50 || th.AvgLedgerCloseSeconds != 6 {
+		t.Errorf("overrides not applied: %+v", th)
+	}
+}
+
+func TestIndexerStats_CaughtUpAtCeilingInterval_IsHealthy(t *testing.T) {
+	t.Setenv("POLL_INTERVAL_CEILING_MS", "600000")
+	pollAt := time.Now().Add(-9 * time.Minute)
+	ledger := int64(1000)
+	setChainTip(1100) // ~100 ledgers behind, normal for a 10 minute poll
+
+	rec := httptest.NewRecorder()
+	IndexerStats(&mockStatsDB{lastLedger: &ledger, lastPollAt: &pollAt}).ServeHTTP(rec, statsReq())
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp IndexerStatsResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Status != "healthy" {
+		t.Errorf("want healthy, got %q", resp.Status)
+	}
+}
+
+func TestIndexerStats_LagSecondsFromLedgerTimestamp(t *testing.T) {
+	now := time.Now()
+	closedAt := now.Add(-42 * time.Second)
+	ledger := int64(1000)
+	setChainTip(1003)
+
+	rec := httptest.NewRecorder()
+	IndexerStats(&mockStatsDB{lastLedger: &ledger, lastPollAt: &now, lastLedgerT: &closedAt}).ServeHTTP(rec, statsReq())
+
+	var resp IndexerStatsResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.LagSecondsEstimated == nil || *resp.LagSecondsEstimated < 41 || *resp.LagSecondsEstimated > 44 {
+		t.Errorf("lag_seconds_estimated: want ~42 from ledger timestamp, got %v", resp.LagSecondsEstimated)
+	}
+}
+
+func TestIndexerStats_LagSecondsFallsBackToConfiguredCloseTime(t *testing.T) {
+	now := time.Now()
+	ledger := int64(1000)
+	setChainTip(1004)
+
+	rec := httptest.NewRecorder()
+	IndexerStats(&mockStatsDB{lastLedger: &ledger, lastPollAt: &now}).ServeHTTP(rec, statsReq())
+
+	var resp IndexerStatsResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.LagSecondsEstimated == nil || *resp.LagSecondsEstimated != 22 {
+		t.Errorf("lag_seconds_estimated: want 4 x 5.5 = 22, got %v", resp.LagSecondsEstimated)
 	}
 }

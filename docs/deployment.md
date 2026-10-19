@@ -286,7 +286,7 @@ curl https://your-domain.com/v1/ready
 | Endpoint | Description |
 |---|---|
 | `GET /v1/health` | Public liveness check. No dependency calls — just confirms the process is up (issue #243). |
-| `GET /v1/ready` | Public readiness check. Verifies Postgres, Redis, and the gRPC backend (issue #243); 503 if any is unreachable. |
+| `GET /v1/ready` | Public readiness check. Verifies Postgres, Redis, and the gRPC backend (issue #243). 503 only if Postgres or the gRPC backend is unavailable; a Redis failure is reported as `degraded` with a 200 (issue #758). |
 | `GET /internal/status` | Internal metrics endpoint (planned for a future release). |
 
 `/v1/health` response shape (always 200 while the process is alive):
@@ -302,9 +302,13 @@ curl https://your-domain.com/v1/ready
 ```
 
 ```json
-{"status":"degraded","indexer_lag":null,"checks":{"postgres":"error: dial tcp: connection refused","redis":"ok","grpc_api":"ok"}}
+{"status":"degraded","indexer_lag":null,"checks":{"postgres":"unavailable","redis":"ok","grpc_api":"ok"}}
 ```
-`indexer_lag` is null whenever Postgres is unreachable or the chain-tip cache hasn't been populated yet. Any non-"ok" entry in `checks` returns HTTP 503.
+
+```json
+{"status":"degraded","indexer_lag":3,"checks":{"postgres":"ok","redis":"degraded","grpc_api":"ok"}}
+```
+`indexer_lag` is null whenever Postgres is unreachable or the chain-tip cache hasn't been populated yet. `postgres` and `grpc_api` are required: `unavailable` returns HTTP 503. `redis` is optional: `degraded` still returns HTTP 200. The public body never includes hostnames or driver errors; those are logged by the API (`readiness check failed`).
 
 ### PostgreSQL Disk Usage
 
@@ -596,7 +600,7 @@ lasting change.
 - **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
 - **Go API health check**: `GET /v1/ready` (used by Fly's HTTP service check
   in `fly/api.toml` to gate traffic routing). `/v1/ready` verifies
-  Postgres/Redis/gRPC reachability, unlike `/v1/health`, which is a cheap
+  Postgres/gRPC reachability (and reports Redis as degraded), unlike `/v1/health`, which is a cheap
   liveness check that says only that the process is up (issue #243).
 - **gRPC API**: no HTTP health endpoint exists in `crates/api` today; Fly's
   check in `fly/grpc-api.toml` is a plain TCP check against port 50051. This

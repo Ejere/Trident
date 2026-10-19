@@ -266,6 +266,7 @@ type indexerStatsRow struct {
 	eventsLastPoll     *int64
 	pollDurationMs     *int64
 	lastPollAt         *time.Time
+	lastLedgerTime     *time.Time
 }
 
 func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) {
@@ -275,7 +276,9 @@ func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) 
 		        events_indexed_total,
 		        events_in_last_poll,
 		        poll_duration_ms,
-		        last_poll_at
+		        last_poll_at,
+		        (SELECT lm.ledger_timestamp FROM ledger_metadata lm
+		          WHERE lm.ledger_sequence = system_state.last_ledger_indexed)
 		   FROM system_state
 		  WHERE key = 'latest_ledger_cursor'`,
 	).Scan(
@@ -284,6 +287,7 @@ func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) 
 		&row.eventsLastPoll,
 		&row.pollDurationMs,
 		&row.lastPollAt,
+		&row.lastLedgerTime,
 	)
 	if err != nil && err != pgx.ErrNoRows {
 		return row, err
@@ -295,11 +299,11 @@ func queryIndexerStats(ctx context.Context, db DBPool) (indexerStatsRow, error) 
 // Status logic
 // ---------------------------------------------------------------------------
 
-func indexerStatus(lastPollAt *time.Time, lagLedgers *int64) string {
-	if lastPollAt == nil || time.Since(*lastPollAt) > 60*time.Second {
+func indexerStatus(lastPollAt *time.Time, lagLedgers *int64, th IndexerThresholds) string {
+	if lastPollAt == nil || time.Since(*lastPollAt) > th.Stall {
 		return "stalled"
 	}
-	if lagLedgers != nil && *lagLedgers > 10 {
+	if lagLedgers != nil && *lagLedgers > th.LagLedgers {
 		return "lagging"
 	}
 	return "healthy"
@@ -308,13 +312,6 @@ func indexerStatus(lastPollAt *time.Time, lagLedgers *int64) string {
 // ---------------------------------------------------------------------------
 // Response
 // ---------------------------------------------------------------------------
-
-// avgLedgerCloseSeconds is Stellar's protocol-target ledger close time, used
-// to convert ledger-count lag into an estimated wall-clock staleness figure
-// (issue #294). Kept in sync with crates/indexer/src/metrics.rs's
-// AVG_LEDGER_CLOSE_SECONDS; see docs/observability/data-freshness.md for the
-// full freshness contract.
-const avgLedgerCloseSeconds = 5.0
 
 // IndexerStatsResponse is the JSON body for GET /v1/stats/indexer.
 type IndexerStatsResponse struct {
@@ -341,6 +338,7 @@ type IndexerStatsResponse struct {
 // timeout and cached for 10 seconds; it is null on RPC failure. HTTP 503 is
 // returned only when status == "stalled". No API key is required.
 func IndexerStats(db DBPool) http.HandlerFunc {
+	th := loadIndexerThresholds()
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
@@ -364,11 +362,14 @@ func IndexerStats(db DBPool) http.HandlerFunc {
 		if chainTip != nil && stats.lastLedgerIndexed != nil {
 			lag := *chainTip - *stats.lastLedgerIndexed
 			lagLedgers = &lag
-			estimated := float64(lag) * avgLedgerCloseSeconds
+			estimated := float64(lag) * th.AvgLedgerCloseSeconds
+			if stats.lastLedgerTime != nil {
+				estimated = math.Max(0, time.Since(*stats.lastLedgerTime).Seconds())
+			}
 			lagSecondsEstimated = &estimated
 		}
 
-		status := indexerStatus(stats.lastPollAt, lagLedgers)
+		status := indexerStatus(stats.lastPollAt, lagLedgers, th)
 
 		// Update Prometheus gauges with latest observed values.
 		if lagLedgers != nil {

@@ -73,17 +73,22 @@ paths:
       summary: Readiness check
       description: >-
         Verifies Postgres, Redis, and the gRPC backend concurrently, each
-        with a 3-second timeout (issue #243). Returns 503 if any dependency
-        check fails. Intended for Kubernetes' readiness probe / Fly's HTTP
-        service check, so a pod with a broken dependency is pulled out of
-        rotation instead of continuing to receive traffic it can't serve.
+        with a 3-second timeout (issue #243). Returns 503 only when a
+        dependency required to serve core traffic (Postgres or the gRPC
+        backend) is unavailable, so a pod that cannot serve is pulled out of
+        rotation. Redis backs fail-open middlewares only (rate limit, cache,
+        idempotency), so a Redis failure is reported as `degraded` with a 200
+        and does not remove the pod from rotation (issue #758). The body
+        carries generic statuses only; error details are logged server-side.
       operationId: getReady
       tags:
         - System
       security: []
       responses:
         "200":
-          description: All dependencies reachable
+          description: >-
+            Pod can serve core traffic. `status` is "degraded" and
+            `checks.redis` is "degraded" when only Redis is unreachable.
           content:
             application/json:
               schema:
@@ -92,9 +97,9 @@ paths:
           $ref: "#/components/responses/TooManyRequestsIPOnly"
         "503":
           description: >-
-            Either one or more dependencies is unreachable (ReadyResponse
-            body, status "degraded", the failing entry in checks set to
-            "error: ..."), or the server is shedding load under the global
+            Postgres or the gRPC backend is unavailable (ReadyResponse body,
+            status "degraded", the failing entry in checks set to
+            "unavailable"), or the server is shedding load under the global
             concurrency cap (ErrorResponse body, Retry-After header set) —
             the same outermost load-shedding behavior every endpoint shares.
           headers:
@@ -869,13 +874,16 @@ components:
       properties:
         postgres:
           type: string
-          description: '"ok" or "error: <message>"'
+          enum: [ok, unavailable]
+          description: Required dependency. "unavailable" fails readiness.
         redis:
           type: string
-          description: '"ok" or "error: <message>"'
+          enum: [ok, degraded]
+          description: Optional dependency (middlewares fail open). "degraded" does not fail readiness.
         grpc_api:
           type: string
-          description: '"ok" or "error: <message>"'
+          enum: [ok, unavailable]
+          description: Required dependency. "unavailable" fails readiness.
 
     ReadyResponse:
       type: object
@@ -887,7 +895,9 @@ components:
         status:
           type: string
           enum: [ok, degraded]
-          description: '"degraded" when any dependency check in `checks` failed.'
+          description: >-
+            "degraded" when any dependency check in `checks` failed. The HTTP
+            status is 503 only when a required dependency failed.
         indexer_lag:
           type: integer
           format: int64

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/gen"
@@ -150,12 +151,13 @@ func TestReady_PostgresDown_Returns503(t *testing.T) {
 	contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
 }
 
-// TestReady_RedisDown_Returns503 verifies a Redis ping failure alone
-// degrades the whole readiness check to 503 (issue #243).
-func TestReady_RedisDown_Returns503(t *testing.T) {
+// TestReady_RedisDown_StaysReady verifies a Redis failure is reported as
+// degraded but does not fail readiness: Redis-backed middlewares fail open,
+// so a Redis blip must not pull every pod out of the Service (issue #758).
+func TestReady_RedisDown_StaysReady(t *testing.T) {
 	ledger := int64(1)
 	db := &healthMockDB{lastLedger: &ledger}
-	rdb := fakeRedisPinger{err: errors.New("dial tcp: connection refused")}
+	rdb := fakeRedisPinger{err: errors.New("dial tcp 10.0.3.7:6379: connection refused")}
 	grpcClient := &fakeEventsClient{
 		listEvents: func(_ context.Context, _ *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
 			return &gen.ListEventsResponse{}, nil
@@ -166,11 +168,45 @@ func TestReady_RedisDown_Returns503(t *testing.T) {
 	rr := httptest.NewRecorder()
 	Ready(db, rdb, grpcClient).ServeHTTP(rr, req)
 
-	assertDegraded(t, rr, "redis")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body ReadyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Status != "degraded" {
+		t.Errorf("status: want degraded, got %q", body.Status)
+	}
+	if body.Checks.Redis != "degraded" || body.Checks.Postgres != "ok" || body.Checks.GRPCAPI != "ok" {
+		t.Errorf("unexpected checks: %+v", body.Checks)
+	}
 
 	doc := contracttest.LoadSpec(t)
 	router := contracttest.NewRouter(t, doc)
 	contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
+}
+
+// TestReady_ErrorsNotLeaked verifies hostnames, ports and driver messages
+// from failing dependencies never appear in the public body (issue #758).
+func TestReady_ErrorsNotLeaked(t *testing.T) {
+	db := &healthMockDB{pingErr: errors.New("dial tcp pgbouncer.internal:6432: connection refused")}
+	rdb := fakeRedisPinger{err: errors.New("dial tcp redis.internal:6379: i/o timeout")}
+	grpcClient := &fakeEventsClient{
+		listEvents: func(_ context.Context, _ *gen.ListEventsRequest) (*gen.ListEventsResponse, error) {
+			return nil, errors.New("rpc error: dial tcp indexer.internal:50051: connect: refused")
+		},
+	}
+
+	rr := httptest.NewRecorder()
+	Ready(db, rdb, grpcClient).ServeHTTP(rr, healthReadyReq("/v1/ready"))
+
+	body := rr.Body.String()
+	for _, leak := range []string{"internal", "dial tcp", "6432", "6379", "50051", "refused", "timeout", "rpc error"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("body leaks %q: %s", leak, body)
+		}
+	}
 }
 
 // TestReady_GRPCDown_Returns503 verifies a gRPC backend failure alone

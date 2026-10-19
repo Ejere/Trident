@@ -273,7 +273,6 @@ func main() {
 		defer func() { _ = webhookDB.Close() }()
 	}
 	startWebhookWorker(ctx, webhookDB, redisClient)
-	startWebhookCleanupJob(ctx, webhookDB)
 
 	// Configure internal status handler with dependencies.
 	handlers.SetInternalStatusDeps(pool, redisClient, hub)

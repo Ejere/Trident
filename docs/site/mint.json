@@ -84,6 +84,12 @@
       ]
     },
     {
+      "group": "Webhooks",
+      "pages": [
+        "webhooks"
+      ]
+    },
+    {
       "group": "WebSocket",
       "pages": [
         "websocket/connecting",

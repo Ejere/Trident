@@ -155,6 +155,19 @@ Variables marked **REQUIRED** must be set before the service starts. Variables m
 |--------------------------|----------|---------|----------------------|-------------|
 | `WEBHOOK_CONSUMER_GROUP` | OPTIONAL | string  | `trident-webhooks`   | Redis Stream consumer group for the webhook delivery worker. |
 | `WEBHOOK_CONSUMER_NAME`  | OPTIONAL | string  | `webhook-worker`     | Redis Stream consumer name. |
+| `WEBHOOK_DELIVERY_WORKERS` | OPTIONAL | integer | `16` | Delivery worker pool size. |
+| `WEBHOOK_RETRY_BASE_SECONDS` | OPTIONAL | integer | `10` | First retry delay; doubles on each failed attempt. |
+| `WEBHOOK_RETRY_MAX_BACKOFF_SECONDS` | OPTIONAL | integer | `3600` | Maximum delay between retries. |
+| `WEBHOOK_RETRY_WINDOW_HOURS` | OPTIONAL | integer | `24` | Hours a delivery is retried before it is dead-lettered. See the [webhook guide](/webhooks). |
+
+### Indexer status thresholds
+
+| Variable | Required | Type | Default | Description |
+|----------|----------|------|---------|-------------|
+| `POLL_INTERVAL_CEILING_MS` | OPTIONAL | integer | `5000` | Set to the indexer's value so the defaults below track its slowest poll interval. |
+| `INDEXER_STALL_THRESHOLD_SECONDS` | OPTIONAL | integer | `max(60, 5 x ceiling)` | Seconds without a poll before `GET /v1/stats/indexer` reports `stalled`. |
+| `INDEXER_LAG_THRESHOLD_LEDGERS` | OPTIONAL | integer | `ceil(ceiling / close time) + 10`, min 10 | Ledger lag above which the status is `lagging`. |
+| `LEDGER_CLOSE_SECONDS` | OPTIONAL | number | `5.5` | Average ledger close time for the lag-seconds fallback. |
 
 ### Request body limits and abuse protection
 

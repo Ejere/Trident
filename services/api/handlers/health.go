@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -67,6 +68,14 @@ func Health() http.HandlerFunc {
 	}
 }
 
+// Public readiness check values. Raw dependency errors (hostnames, ports,
+// driver messages) are logged, never returned on this unauthenticated route.
+const (
+	checkOK          = "ok"
+	checkDegraded    = "degraded"
+	checkUnavailable = "unavailable"
+)
+
 // ReadyChecks holds the per-dependency check results.
 type ReadyChecks struct {
 	Postgres string `json:"postgres"`
@@ -81,15 +90,19 @@ type ReadyResponse struct {
 	Checks     ReadyChecks `json:"checks"`
 }
 
-// Ready handles GET /v1/ready — a readiness check (issue #243).
+// Ready handles GET /v1/ready — a readiness check (issue #243, #758).
 //
 // Runs Postgres, Redis, and gRPC checks concurrently with a shared
-// 3-second timeout. Returns 200 when all checks pass, 503 when any fail —
-// this is what Kubernetes' readiness probe should hit, so a pod with a
-// broken dependency is pulled out of the Service's endpoint rotation
-// instead of continuing to receive traffic it can't serve. The indexer_lag
-// field is populated from system_state when Postgres is healthy and the
-// chain tip is available in the cache; null otherwise.
+// 3-second timeout. Readiness reflects whether this pod can serve its core
+// traffic: Postgres and the gRPC backend are required, so a failure in
+// either returns 503 and pulls the pod out of the Service. Redis only backs
+// middlewares that fail open (rate limit, cache, idempotency), so a Redis
+// failure is reported as checks.redis "degraded" and status "degraded" but
+// still returns 200 — a Redis blip must not remove every pod at once.
+//
+// The public body carries only generic statuses; the underlying errors are
+// logged. The indexer_lag field is populated from system_state when Postgres
+// is healthy and the chain tip is available in the cache; null otherwise.
 func Ready(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		parentCtx := r.Context()
@@ -127,11 +140,15 @@ func Ready(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.Han
 
 		wg.Wait()
 
+		logDependencyFailure("postgres", pgErr)
+		logDependencyFailure("redis", redisErr)
+		logDependencyFailure("grpc_api", grpcErr)
+
 		resp := ReadyResponse{
 			Checks: ReadyChecks{
-				Postgres: resultString(pgErr),
-				Redis:    resultString(redisErr),
-				GRPCAPI:  resultString(grpcErr),
+				Postgres: requiredCheckString(pgErr),
+				Redis:    optionalCheckString(redisErr),
+				GRPCAPI:  requiredCheckString(grpcErr),
 			},
 		}
 
@@ -142,22 +159,38 @@ func Ready(db DBPool, redisClient RedisPinger, grpcClient EventsLister) http.Han
 			}
 		}
 
-		if pgErr != nil || redisErr != nil || grpcErr != nil {
+		if pgErr != nil || grpcErr != nil {
 			resp.Status = "degraded"
 			writeJSON(w, http.StatusServiceUnavailable, resp)
 			return
 		}
 
 		resp.Status = "ok"
+		if redisErr != nil {
+			resp.Status = "degraded"
+		}
 		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
-func resultString(err error) string {
+func requiredCheckString(err error) string {
 	if err == nil {
-		return "ok"
+		return checkOK
 	}
-	return "error: " + err.Error()
+	return checkUnavailable
+}
+
+func optionalCheckString(err error) string {
+	if err == nil {
+		return checkOK
+	}
+	return checkDegraded
+}
+
+func logDependencyFailure(name string, err error) {
+	if err != nil && err != errNoDatabase && err != errNoRedis && err != errNoGRPCClient {
+		slog.Warn("readiness check failed", "dependency", name, "err", err)
+	}
 }
 
 // checkPostgres pings the pool then queries system_state for the indexer's

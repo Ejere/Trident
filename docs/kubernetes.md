@@ -511,7 +511,7 @@ any of these, redact the credential portion — don't log the raw env var value.
 The Go API exposes two endpoints for Kubernetes' liveness and readiness probes, split per issue #243 so a dependency outage never causes a restart loop that can't fix it:
 
 - **Liveness** — `GET /v1/health` (`failureThreshold: 3`): cheap, no dependency calls, just confirms the process is up. Restarts the container after 3 consecutive failures. Never fails because Postgres/Redis/the gRPC backend is down — restarting the pod doesn't fix an external dependency, so liveness must not conflate "the process is stuck" with "a dependency is unreachable."
-- **Readiness** — `GET /v1/ready` (`failureThreshold: 1`): checks Postgres, Redis, and the gRPC backend concurrently (3s timeout per dependency) and returns 503 if any fail. Removes the pod from the Service load balancer on the first failure for faster traffic isolation.
+- **Readiness** — `GET /v1/ready` (`failureThreshold: 3`): checks Postgres, Redis, and the gRPC backend concurrently (3s timeout per dependency). Returns 503 only when Postgres or the gRPC backend fails, and only after 3 consecutive failures removes the pod from the Service. A Redis failure is reported as `degraded` with a 200 because the Redis-backed middlewares (rate limit, cache, idempotency) fail open, so a Redis outage does not take every pod out of rotation.
 
 ## Upgrading
 

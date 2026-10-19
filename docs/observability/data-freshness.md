@@ -38,12 +38,14 @@ tip) and can disagree briefly — by design, since the API's view is what
 external consumers see and must not depend on the indexer's internal metrics
 port being reachable.
 
-**Why `~5s` and not a measured average:** Stellar's protocol targets a
-constant ~5 second ledger close time by design (unlike, say, Bitcoin's
-variable block time), so a fixed constant is a reasonable estimate without
-the complexity of tracking a rolling average. `AVG_LEDGER_CLOSE_SECONDS` in
-`crates/indexer/src/metrics.rs` and `avgLedgerCloseSeconds` in
-`services/api/handlers/stats.go` must be kept in sync if this ever changes.
+**How `lag_seconds_estimated` is computed on the API:** when
+`ledger_metadata` has the close time of the last indexed ledger, the API
+reports the wall-clock time since that close (`now - ledger_timestamp`).
+Only when that row is missing does it fall back to
+`lag_ledgers x LEDGER_CLOSE_SECONDS` (default 5.5s, the observed mainnet
+average; protocol target is ~5s). The indexer's own gauge
+(`AVG_LEDGER_CLOSE_SECONDS` in `crates/indexer/src/metrics.rs`) still uses a
+fixed 5.0.
 
 ## `status` semantics
 
@@ -51,9 +53,23 @@ the complexity of tracking a rolling average. `AVG_LEDGER_CLOSE_SECONDS` in
 
 | `status` | Condition | HTTP status |
 |---|---|---|
-| `healthy` | Last poll within 60s and lag_ledgers ≤ 10 (or unknown) | 200 |
-| `lagging` | Last poll within 60s but lag_ledgers > 10 | 200 |
-| `stalled` | No successful poll in the last 60s | 503 |
+| `healthy` | Last poll within the stall threshold and lag_ledgers ≤ the lag threshold (or unknown) | 200 |
+| `lagging` | Last poll within the stall threshold but lag_ledgers > the lag threshold | 200 |
+| `stalled` | No successful poll within the stall threshold | 503 |
+
+The thresholds are configurable and default from the indexer's adaptive-poll
+ceiling (`POLL_INTERVAL_CEILING_MS`, set it on the API as well), because a
+caught-up indexer legitimately polls only once per ceiling interval, and
+backs off up to 4x when the RPC is degraded:
+
+- stall threshold: `INDEXER_STALL_THRESHOLD_SECONDS`, default
+  `max(60s, 5 x ceiling)` (4x degraded backoff plus one interval of margin).
+- lag threshold: `INDEXER_LAG_THRESHOLD_LEDGERS`, default
+  `max(10, ceil(ceiling / LEDGER_CLOSE_SECONDS) + 10)` ledgers.
+
+With the default 5s ceiling these are 60s and 11 ledgers; with a 600s ceiling
+they are 3000s and 120 ledgers. Keep `ALERT_LAG_THRESHOLD` above the lag
+threshold so alerts fire only after the status page has already flagged lag.
 
 `stalled` is the only case that returns a non-2xx status — `lagging` is still
 a 200 because the data is real, just behind, which is a materially different

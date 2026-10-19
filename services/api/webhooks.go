@@ -27,8 +27,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const maxWebhookAttempts = 5
-
 type webhookSubscription struct {
 	ID         string     `json:"id"`
 	APIKeyID   string     `json:"apiKeyId,omitempty"`
@@ -154,6 +152,19 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 		consumerName = "webhook-worker"
 	}
 
+	cfg := loadWebhookRetryConfig()
+	wake := make(chan struct{}, cfg.Workers)
+	store := sqlWebhookOutbox{db: db}
+	for i := 0; i < cfg.Workers; i++ {
+		go runWebhookDeliveryWorker(ctx, store, cfg, wake)
+	}
+
+	ack := func(id string) {
+		if _, err := redisClient.XAck(ctx, streamKey, groupName, id).Result(); err != nil {
+			slog.Warn("failed to ack message", "err", err)
+		}
+	}
+
 	go func() {
 		for {
 			entries, err := redisClient.XReadGroup(ctx, &redis.XReadGroupArgs{
@@ -165,7 +176,10 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 				NoAck:    false,
 			}).Result()
 			if err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, redis.Nil) {
+				if errors.Is(err, redis.Nil) {
+					continue
+				}
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 					return
 				}
 				slog.Error("webhook worker read failed", "err", err)
@@ -174,39 +188,31 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 			}
 			for _, stream := range entries {
 				for _, message := range stream.Messages {
-					var event webhookEvent
-					if raw, ok := message.Values["event"]; ok {
-						if parsed, err := parseWebhookEvent(raw); err == nil {
-							event = parsed
-						} else {
-							slog.Error("failed to parse webhook event", "err", err)
-							if _, ackErr := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); ackErr != nil {
-								slog.Warn("failed to ack message", "err", ackErr)
-							}
-							continue
-						}
-					} else if raw, ok := message.Values["payload"]; ok {
-						if parsed, err := parseWebhookEvent(raw); err == nil {
-							event = parsed
-						} else {
-							slog.Error("failed to parse webhook payload", "err", err)
-							if _, ackErr := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); ackErr != nil {
-								slog.Warn("failed to ack message", "err", ackErr)
-							}
-							continue
-						}
-					} else {
+					raw, ok := message.Values["event"]
+					if !ok {
+						raw, ok = message.Values["payload"]
+					}
+					if !ok {
 						slog.Warn("webhook worker received empty payload", "id", message.ID)
-						if _, ackErr := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); ackErr != nil {
-							slog.Warn("failed to ack message", "err", ackErr)
-						}
+						ack(message.ID)
 						continue
 					}
-					if err := processWebhookEvent(ctx, db, event); err != nil {
-						slog.Error("webhook delivery failed", "err", err)
+					event, err := parseWebhookEvent(raw)
+					if err != nil {
+						slog.Error("failed to parse webhook event", "err", err)
+						ack(message.ID)
+						continue
 					}
-					if _, err := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); err != nil {
-						slog.Warn("failed to ack message", "err", err)
+					queued, err := enqueueWithRetry(ctx, db, event)
+					if err != nil {
+						return
+					}
+					ack(message.ID)
+					for i := int64(0); i < queued; i++ {
+						select {
+						case wake <- struct{}{}:
+						default:
+						}
 					}
 				}
 			}
@@ -214,24 +220,22 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 	}()
 }
 
-func startWebhookCleanupJob(ctx context.Context, db *sql.DB) {
-	if db == nil {
-		return
-	}
-	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if _, err := db.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - INTERVAL '7 days'`); err != nil {
-					slog.Warn("webhook cleanup failed", "err", err)
-				}
-			}
+// enqueueWithRetry persists the delivery intents for an event, retrying until
+// it succeeds so the stream entry is never acked before it is durable. It
+// only returns an error when ctx is done.
+func enqueueWithRetry(ctx context.Context, db *sql.DB, event webhookEvent) (int64, error) {
+	for {
+		queued, err := enqueueWebhookEvent(ctx, db, event)
+		if err == nil {
+			return queued, nil
 		}
-	}()
+		slog.Error("failed to enqueue webhook deliveries", "event_id", event.ID, "err", err)
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(webhookEnqueueRetryDelay):
+		}
+	}
 }
 
 func parseWebhookEvent(raw any) (webhookEvent, error) {
@@ -261,84 +265,6 @@ func parseWebhookEvent(raw any) (webhookEvent, error) {
 	default:
 		return webhookEvent{}, fmt.Errorf("unsupported event payload type %T", raw)
 	}
-}
-
-func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) error {
-	if db == nil {
-		return nil
-	}
-	rows, err := db.QueryContext(ctx, `
-		SELECT id, api_key_id, contract_id, topic0, target_url, secret, created_at, paused_at, network
-		FROM webhook_subscriptions
-		WHERE contract_id = $1
-		  AND paused_at IS NULL
-		  AND (topic0 IS NULL OR topic0 = $2)
-		  AND network = $3
-	`, event.ContractID, event.Topic0, event.Network)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		var sub webhookSubscription
-		var topic0 sql.NullString
-		var pausedAt sql.NullTime
-		if err := rows.Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &sub.CreatedAt, &pausedAt, &sub.Network); err != nil {
-			return err
-		}
-		if topic0.Valid {
-			sub.Topic0 = &topic0.String
-		}
-		if pausedAt.Valid {
-			sub.PausedAt = &pausedAt.Time
-		}
-		if err := deliverSubscriptionWithRetry(ctx, db, sub, event); err != nil {
-			slog.Warn("webhook delivery failed for subscription", "subscription_id", sub.ID, "err", err)
-		}
-	}
-	return rows.Err()
-}
-
-func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSubscription, event webhookEvent) error {
-	for attempt := 1; attempt <= maxWebhookAttempts; attempt++ {
-		start := time.Now()
-		result := performWebhookDelivery(ctx, sub, event)
-		durationMs := time.Since(start).Milliseconds()
-
-		isLast := attempt == maxWebhookAttempts
-		status := "failed"
-		if result.Success {
-			status = "success"
-		} else if isLast {
-			status = "dead_lettered"
-		}
-
-		if err := recordWebhookDelivery(ctx, db, sub.ID, event.ID, attempt, status, result); err != nil {
-			slog.Warn("failed to record webhook delivery", "err", err)
-		}
-
-		handlers.RecordWebhookDelivery(result.Success, isLast && !result.Success, durationMs)
-		if result.Success {
-			return nil
-		}
-		if isLast {
-			slog.Warn("webhook delivery dead-lettered after max attempts",
-				"subscription_id", sub.ID,
-				"event_id", event.ID,
-				"attempts", maxWebhookAttempts,
-			)
-			return result.Err
-		}
-
-		sleepDuration := time.Duration(1<<uint(attempt-1)) * time.Second
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(sleepDuration):
-		}
-	}
-	return nil
 }
 
 func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event webhookEvent) webhookDeliveryResult {
