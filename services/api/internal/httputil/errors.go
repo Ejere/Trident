@@ -13,9 +13,12 @@ import (
 type ErrorCode string
 
 const (
-	NOT_FOUND        ErrorCode = "NOT_FOUND"
-	UNAUTHORIZED     ErrorCode = "UNAUTHORIZED"
-	RATE_LIMITED     ErrorCode = "RATE_LIMITED"
+	NOT_FOUND    ErrorCode = "NOT_FOUND"
+	UNAUTHORIZED ErrorCode = "UNAUTHORIZED"
+	RATE_LIMITED ErrorCode = "RATE_LIMITED"
+	// QUOTA_EXCEEDED is returned when a key exhausts its daily or monthly
+	// request quota (distinct from the per-second RATE_LIMITED).
+	QUOTA_EXCEEDED   ErrorCode = "QUOTA_EXCEEDED"
 	INVALID_ARGUMENT ErrorCode = "INVALID_ARGUMENT"
 	UNAVAILABLE      ErrorCode = "UNAVAILABLE"
 	INTERNAL         ErrorCode = "INTERNAL"

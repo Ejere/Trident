@@ -398,3 +398,68 @@ func TestRateLimitMetrics_InitiallyZero(t *testing.T) {
 		t.Errorf("want (0,0), got (%d,%d)", allowed, rejected)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Tier cache: lookup errors must not poison the cache (issue #754)
+// ---------------------------------------------------------------------------
+
+type flakyTierDB struct {
+	mu    sync.Mutex
+	calls int
+	tier  string
+}
+
+func (f *flakyTierDB) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.calls == 1 {
+		return &mockTierRow{err: context.DeadlineExceeded}
+	}
+	return &mockTierRow{tier: f.tier}
+}
+
+func TestTierCache_LookupErrorIsNotCached(t *testing.T) {
+	tc := NewTierCache()
+	db := &flakyTierDB{tier: "pro"}
+
+	if got := tc.resolve(context.Background(), "k", db); got != "free" {
+		t.Fatalf("first lookup (db timeout) = %q, want free fallback", got)
+	}
+	if got := tc.resolve(context.Background(), "k", db); got != "pro" {
+		t.Fatalf("next request tier = %q, want pro", got)
+	}
+}
+
+func TestTierCache_LookupErrorKeepsPreviousKnownTier(t *testing.T) {
+	tc := NewTierCache()
+	tc.set(hashKey("k"), "pro")
+	tc.mu.Lock()
+	e := tc.entries[hashKey("k")]
+	e.exp = time.Now().Add(-time.Second)
+	tc.entries[hashKey("k")] = e
+	tc.mu.Unlock()
+
+	got := tc.resolve(context.Background(), "k", &mockTierDB{err: context.DeadlineExceeded})
+	if got != "pro" {
+		t.Fatalf("tier on lookup error = %q, want previously known pro", got)
+	}
+}
+
+func TestTierCache_EvictsExpiredEntries(t *testing.T) {
+	tc := NewTierCache()
+	tc.mu.Lock()
+	for i := 0; i < 50; i++ {
+		tc.entries[fmt.Sprintf("old-%d", i)] = tierEntry{tier: "free", exp: time.Now().Add(-time.Hour)}
+	}
+	tc.mu.Unlock()
+
+	tc.evictExpired(time.Now())
+
+	tc.mu.RLock()
+	n := len(tc.entries)
+	tc.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("entries after eviction = %d, want 0", n)
+	}
+}

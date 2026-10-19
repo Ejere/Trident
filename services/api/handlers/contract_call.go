@@ -81,6 +81,28 @@ type SorobanRPCCaller interface {
 // includes footprint/state-diff information, it is surfaced only as
 // informational metadata never as something this handler acts on.
 func CallContract(rpc SorobanRPCCaller) http.HandlerFunc {
+	return CallContractWith(ContractCallConfig{Default: rpc})
+}
+
+// ContractCallConfig configures CallContractWith.
+type ContractCallConfig struct {
+	// Callers routes by the authenticated key's network. A key whose network
+	// has no caller is rejected with 403.
+	Callers map[string]SorobanRPCCaller
+	// Default is used regardless of network when Callers is empty (legacy
+	// single-endpoint behaviour).
+	Default SorobanRPCCaller
+	// CacheTTL caches successful simulations of identical calls (0 = off).
+	CacheTTL time.Duration
+	// SimulationAllowed spends one unit of the key's simulation budget; nil
+	// means unlimited. Errors fail open.
+	SimulationAllowed func(ctx context.Context, apiKeyID string) (bool, error)
+}
+
+// CallContractWith is CallContract with per-network routing, a simulation
+// budget and short-TTL caching. See CallContract for the read-only rationale.
+func CallContractWith(cfg ContractCallConfig) http.HandlerFunc {
+	cache := newCallCache(cfg.CacheTTL)
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -122,9 +144,39 @@ func CallContract(rpc SorobanRPCCaller) http.HandlerFunc {
 			args = append(args, scv)
 		}
 
+		network := middleware.NetworkFromContext(ctx)
+		var rpc SorobanRPCCaller
+		if len(cfg.Callers) > 0 {
+			caller, ok := cfg.Callers[network]
+			if !ok {
+				httputil.WriteErrorCtx(ctx, w, http.StatusForbidden, httputil.FORBIDDEN,
+					fmt.Sprintf("API key network %q is not served by this API", network))
+				return
+			}
+			rpc = caller
+		} else {
+			rpc = cfg.Default
+		}
 		if rpc == nil {
 			httputil.WriteErrorCtx(ctx, w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "Soroban RPC is not configured")
 			return
+		}
+
+		cacheKey := network + "|" + contractID + "|" + req.Function + "|" + strings.Join(req.Args, ",")
+		if cached, ok := cache.get(cacheKey); ok {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+
+		if cfg.SimulationAllowed != nil {
+			allowed, err := cfg.SimulationAllowed(ctx, middleware.APIKeyIDFromContext(ctx))
+			if err != nil {
+				slog.Warn("contract call: simulation budget check failed; failing open", "err", err)
+			} else if !allowed {
+				w.Header().Set("Retry-After", "60")
+				httputil.WriteErrorCtx(ctx, w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "contract simulation budget exceeded")
+				return
+			}
 		}
 
 		envelopeXDR, err := buildSimulateEnvelope(contractID, req.Function, args)
@@ -163,11 +215,13 @@ func CallContract(rpc SorobanRPCCaller) http.HandlerFunc {
 			return
 		}
 
-		writeJSON(w, http.StatusOK, ContractCallResponse{
+		resp := ContractCallResponse{
 			Success: true,
 			Result:  decodeScValJSON(scv),
 			RawXDR:  rawXDR,
-		})
+		}
+		cache.set(cacheKey, resp)
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 

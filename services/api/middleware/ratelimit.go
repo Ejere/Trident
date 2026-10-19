@@ -43,6 +43,12 @@ type RateLimitConfig struct {
 	// the affected entry immediately instead of waiting for the TTL. When nil,
 	// TieredRateLimit creates a private cache.
 	Cache *TierCache
+	// Quotas holds per-tier daily/monthly request quotas (zero = unlimited).
+	// Defaults come from QUOTA_<TIER>_DAILY/MONTHLY when nil.
+	Quotas map[string]QuotaConfig
+	// QuotaFn overrides the Redis quota counter. Set in tests. Quotas are
+	// only enforced when this or Redis is configured.
+	QuotaFn QuotaCounterFn
 	// SliderFn overrides the Redis sliding window. Set in tests.
 	SliderFn func(ctx context.Context, key string, limit, windowMs int64) (allowed bool, count int64, err error)
 }
@@ -73,11 +79,19 @@ type tierEntry struct {
 // stale entry with Invalidate — otherwise a new tier would not take effect until
 // the TTL expires (up to tierCacheTTL later).
 type TierCache struct {
-	mu      sync.RWMutex
-	entries map[string]tierEntry
+	mu        sync.RWMutex
+	entries   map[string]tierEntry
+	lastSweep time.Time
 }
 
-const tierCacheTTL = 5 * time.Minute
+const (
+	tierCacheTTL = 5 * time.Minute
+	// tierStaleGrace is how long an expired entry is kept as the "previous
+	// known tier" fallback for a failed lookup before it is evicted.
+	tierStaleGrace = 10 * time.Minute
+	// tierSweepInterval bounds how often set() scans for evictable entries.
+	tierSweepInterval = time.Minute
+)
 
 // NewTierCache returns an empty, ready-to-use tier cache.
 func NewTierCache() *TierCache {
@@ -92,9 +106,37 @@ func (tc *TierCache) get(hash string) (string, bool) {
 }
 
 func (tc *TierCache) set(hash, tier string) {
+	now := time.Now()
 	tc.mu.Lock()
-	tc.entries[hash] = tierEntry{tier: tier, exp: time.Now().Add(tierCacheTTL)}
+	tc.entries[hash] = tierEntry{tier: tier, exp: now.Add(tierCacheTTL)}
+	if now.Sub(tc.lastSweep) >= tierSweepInterval {
+		tc.lastSweep = now
+		tc.evictExpiredLocked(now)
+	}
 	tc.mu.Unlock()
+}
+
+// evictExpired drops entries that expired more than tierStaleGrace ago.
+func (tc *TierCache) evictExpired(now time.Time) {
+	tc.mu.Lock()
+	tc.evictExpiredLocked(now)
+	tc.mu.Unlock()
+}
+
+func (tc *TierCache) evictExpiredLocked(now time.Time) {
+	for k, e := range tc.entries {
+		if now.After(e.exp.Add(tierStaleGrace)) {
+			delete(tc.entries, k)
+		}
+	}
+}
+
+// stale returns the last known tier for hash even if its TTL has lapsed.
+func (tc *TierCache) stale(hash string) (string, bool) {
+	tc.mu.RLock()
+	e, ok := tc.entries[hash]
+	tc.mu.RUnlock()
+	return e.tier, ok
 }
 
 // Invalidate drops the cached tier for the given API-key hash so the next
@@ -118,7 +160,14 @@ func (tc *TierCache) resolve(ctx context.Context, apiKey string, db TierDB) stri
 		var t string
 		if err := db.QueryRow(ctx2,
 			`SELECT rate_limit_tier FROM api_keys WHERE key_hash = $1`, hash,
-		).Scan(&t); err == nil && t != "" {
+		).Scan(&t); err != nil {
+			// A failed lookup must not be cached: keep the last known tier
+			// (or free) for this request only and retry on the next one.
+			if prev, ok := tc.stale(hash); ok {
+				return prev
+			}
+			return tier
+		} else if t != "" {
 			tier = t
 		}
 	}
@@ -197,6 +246,13 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 			}
 		}
 	}
+	if cfg.Quotas == nil {
+		cfg.Quotas = defaultQuotas()
+	}
+	incr := cfg.QuotaFn
+	if incr == nil && cfg.Redis != nil {
+		incr = redisQuotaCounter(cfg.Redis)
+	}
 	tc := cfg.Cache
 	if tc == nil {
 		tc = NewTierCache()
@@ -241,6 +297,12 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 				w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
 				httputil.WriteErrorCtx(r.Context(), w, http.StatusTooManyRequests, httputil.RATE_LIMITED, "rate limit exceeded")
 				return
+			}
+
+			if incr != nil {
+				if !checkQuota(w, r, incr, cfg.Quotas[tier], hashKey(key)) {
+					return
+				}
 			}
 
 			rlAllowed.Add(1)

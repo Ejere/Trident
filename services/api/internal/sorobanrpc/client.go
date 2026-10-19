@@ -7,8 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -25,9 +29,33 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-// NewClient builds a Client targeting url using http.DefaultClient.
+// MaxResponseBytes bounds a decoded RPC response body.
+const MaxResponseBytes = 4 << 20
+
+// sharedHTTPClient is pooled across all clients: bounded dial and header
+// timeouts, keep-alive connection reuse, and an overall request timeout.
+var sharedHTTPClient = &http.Client{
+	Timeout: DefaultTimeout,
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   3 * time.Second,
+		ResponseHeaderTimeout: DefaultTimeout,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+	},
+}
+
+// NewClient builds a Client targeting url using the shared pooled HTTP client.
 func NewClient(url string) *Client {
-	return &Client{URL: url, HTTPClient: http.DefaultClient}
+	return &Client{URL: url, HTTPClient: sharedHTTPClient}
+}
+
+// StatusError is returned when the endpoint answers with a non-2xx status.
+type StatusError struct{ Code int }
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("soroban rpc: unexpected HTTP status %d", e.Code)
 }
 
 type jsonRPCRequest struct {
@@ -88,8 +116,21 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return &StatusError{Code: resp.StatusCode}
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("soroban rpc: read response: %w", err)
+	}
+	if len(raw) > MaxResponseBytes {
+		return fmt.Errorf("soroban rpc: response too large (> %d bytes)", MaxResponseBytes)
+	}
+
 	var rpcResp jsonRPCResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+	if err := json.Unmarshal(raw, &rpcResp); err != nil {
 		return fmt.Errorf("soroban rpc: decode response: %w", err)
 	}
 	if rpcResp.Error != nil {
@@ -101,4 +142,81 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 		}
 	}
 	return nil
+}
+
+// endpointCooldown is how long an endpoint that failed with a transport or
+// 5xx/429 error is deprioritised behind healthy ones.
+const endpointCooldown = 30 * time.Second
+
+// FailoverClient calls a prioritised list of Soroban RPC endpoints. A
+// transport error, 5xx or 429 moves on to the next endpoint and puts the failed
+// one on a short cooldown; JSON-RPC application errors are returned as-is.
+type FailoverClient struct {
+	endpoints []*Client
+	mu        sync.Mutex
+	downUntil []time.Time
+}
+
+// NewFailoverClient builds a FailoverClient over urls in priority order.
+func NewFailoverClient(urls []string) *FailoverClient {
+	f := &FailoverClient{downUntil: make([]time.Time, len(urls))}
+	for _, u := range urls {
+		f.endpoints = append(f.endpoints, NewClient(u))
+	}
+	return f
+}
+
+// order returns endpoint indexes: healthy ones first in priority order, then
+// those on cooldown (still tried last rather than giving up).
+func (f *FailoverClient) order() []int {
+	now := time.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var healthy, cooling []int
+	for i := range f.endpoints {
+		if now.Before(f.downUntil[i]) {
+			cooling = append(cooling, i)
+		} else {
+			healthy = append(healthy, i)
+		}
+	}
+	return append(healthy, cooling...)
+}
+
+func (f *FailoverClient) markDown(i int) {
+	f.mu.Lock()
+	f.downUntil[i] = time.Now().Add(endpointCooldown)
+	f.mu.Unlock()
+}
+
+func retryable(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code >= 500 || se.Code == http.StatusTooManyRequests
+	}
+	var re *jsonRPCError
+	if errors.As(err, &re) {
+		return false
+	}
+	return true
+}
+
+// Call implements the same contract as Client.Call across all endpoints.
+func (f *FailoverClient) Call(ctx context.Context, method string, params any, result any) error {
+	var lastErr error
+	for _, i := range f.order() {
+		err := f.endpoints[i].Call(ctx, method, params, result)
+		if err == nil {
+			return nil
+		}
+		if !retryable(err) || ctx.Err() != nil {
+			return err
+		}
+		f.markDown(i)
+		lastErr = err
+	}
+	if lastErr == nil {
+		return fmt.Errorf("soroban rpc: no endpoint configured")
+	}
+	return fmt.Errorf("soroban rpc: all endpoints failed: %w", lastErr)
 }

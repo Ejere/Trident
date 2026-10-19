@@ -122,3 +122,9 @@ exit 1
 - Cache results client-side when the same query is repeated frequently.
 - Use WebSocket subscriptions for real-time use cases — a single persistent connection does not consume REST quota.
 - If you need higher limits, [upgrade to Pro](https://trident.telocel.com/pricing).
+
+## Quotas and stream limits
+
+Beyond the per-second limit, each tier has daily and monthly request quotas. Responses carry `X-Quota-Daily-*` and `X-Quota-Monthly-*` headers (`Limit`, `Remaining`, `Reset` as a Unix timestamp). When a quota is exhausted the API returns `429` with error code `QUOTA_EXCEEDED` and a `Retry-After` set to the reset.
+
+Each key may also hold a limited number of concurrent WebSocket, GraphQL subscription and SSE streams, by tier. Further attempts return `429 RATE_LIMITED` until a stream closes.

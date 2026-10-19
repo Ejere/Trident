@@ -5,6 +5,7 @@ export type TridentErrorCode =
   | "NOT_FOUND"
   | "UNAUTHORIZED"
   | "RATE_LIMITED"
+  | "QUOTA_EXCEEDED"
   | "INVALID_ARGUMENT"
   | "TIMEOUT"
   | "INTERNAL"
