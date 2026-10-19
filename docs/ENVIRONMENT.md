@@ -116,12 +116,21 @@ description is accurate. Keep this file honest by hand.
 | `ALLOWED_ORIGINS` | Required in production | — (dev mode allows any origin) | Comma-separated CORS allow-list (`https://` origins, or `http://localhost*`). |
 | `REQUEST_TIMEOUT_MS` | Optional | `30000` | Per-request timeout middleware; excludes `/ws` and `/v1/events/stream`. |
 | `MAX_WS_CONNECTIONS` | Optional | `1000` | Max concurrent WebSocket connections before new ones are rejected. |
+| `MAX_SSE_CONNECTIONS` | Optional | `1000` | Max concurrent SSE streams per API process. |
+| `STREAM_LIMIT_FREE` / `STREAM_LIMIT_PRO` / `STREAM_LIMIT_INTERNAL` | Optional | `2` / `20` / `200` | Max concurrent WebSocket, GraphQL and SSE streams per API key by tier (Redis-backed, shared across replicas). Excess attempts get 429. |
 | `REDIS_STREAM_KEY` | Optional | `trident:events` | Redis stream key used for event pub/sub and webhook consumption; must match the indexer's stream. |
 | `WEBHOOK_CONSUMER_GROUP` | Optional | `trident-webhooks` | Redis Stream consumer-group name for the webhook delivery worker. |
 | `WEBHOOK_CONSUMER_NAME` | Optional | `webhook-worker` | Redis Stream consumer name for the webhook delivery worker. |
 | `RATE_LIMIT_FREE_RPS` | Optional | `10` | Requests/sec limit, free tier. |
 | `RATE_LIMIT_PRO_RPS` | Optional | `100` | Requests/sec limit, pro/standard tier. |
 | `RATE_LIMIT_INTERNAL_RPS` | Optional | `1000` | Requests/sec limit, internal tier. |
+| `QUOTA_FREE_DAILY` / `QUOTA_FREE_MONTHLY` | Optional | `10000` / `100000` | Request quotas for the free tier. `0` = unlimited. Exceeding returns 429 `QUOTA_EXCEEDED`. |
+| `QUOTA_PRO_DAILY` / `QUOTA_PRO_MONTHLY` | Optional | `1000000` / `20000000` | Request quotas for pro/standard. |
+| `QUOTA_INTERNAL_DAILY` / `QUOTA_INTERNAL_MONTHLY` | Optional | `0` | Request quotas for internal (unlimited by default). |
+| `NETWORK` | Optional | `testnet` | Network served by `STELLAR_RPC_URL(S)` for `POST /v1/contracts/{id}/call`. Keys on another network get 403. |
+| `STELLAR_RPC_URL_TESTNET` / `STELLAR_RPC_URL_MAINNET` (plural `_URLS_` for failover lists) | Optional | — | Per-network Soroban RPC endpoints for contract calls. |
+| `CONTRACT_CALL_SIMS_PER_MINUTE` | Optional | `30` | Per-key upstream simulation budget for contract calls. |
+| `CONTRACT_CALL_CACHE_TTL_SECONDS` | Optional | `5` | Cache TTL for identical successful contract calls (`0` disables). |
 | `PER_IP_RATE_LIMIT_RPS` | Optional | `20` | Pre-auth per-IP request limit, applied before any API key is checked (issue #318). |
 | `PER_IP_RATE_LIMIT_WINDOW_MS` | Optional | `1000` | Window for `PER_IP_RATE_LIMIT_RPS`. |
 | `MAX_IN_FLIGHT_REQUESTS` | Optional | `500` | Global concurrency cap; requests beyond it are shed rather than queued. |

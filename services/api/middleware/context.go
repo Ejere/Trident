@@ -33,3 +33,9 @@ func NetworkFromContext(ctx context.Context) string {
 	}
 	return "testnet"
 }
+
+// WithNetwork attaches an authenticated key's network to ctx for
+// NetworkFromContext. Set by NewDBAuth; exported so tests can simulate it.
+func WithNetwork(ctx context.Context, network string) context.Context {
+	return context.WithValue(ctx, contextKeyNetwork, network)
+}

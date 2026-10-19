@@ -16,7 +16,6 @@ import (
 	"github.com/Depo-dev/trident/services/api/handlers"
 	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/Depo-dev/trident/services/api/internal/profiling"
-	"github.com/Depo-dev/trident/services/api/internal/sorobanrpc"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/ws"
 	"github.com/jackc/pgx/v5"
@@ -284,7 +283,20 @@ func main() {
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
 	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
-	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
+	var streamStore middleware.StreamStore = middleware.NewMemoryStreamStore()
+	if redisClient != nil {
+		streamStore = middleware.NewRedisStreamStore(redisClient)
+	}
+	var streamDB middleware.TierDB
+	if pool != nil {
+		streamDB = pool
+	}
+	streamLimiter := middleware.NewStreamLimiter(middleware.StreamLimitConfig{Store: streamStore, Cache: tierCache, DB: streamDB})
+	sseLimiter := middleware.NewStreamLimiter(middleware.StreamLimitConfig{
+		Store: streamStore, Cache: tierCache, DB: streamDB,
+		MaxPerProcess: envInt("MAX_SSE_CONNECTIONS", 1000),
+	})
+	mux.Handle("GET /v1/events/stream", sseLimiter(handlers.Stream(redisClient)))
 	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
 	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
 	// Admin contract registration CRUD (issue #230)
@@ -306,11 +318,14 @@ func main() {
 	// nil (untyped) when STELLAR_RPC_URL is unset, so CallContract's `rpc ==
 	// nil` check reports 503 rather than a typed-nil interface slipping
 	// through and panicking on first use.
-	var sorobanCaller handlers.SorobanRPCCaller
-	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
-		sorobanCaller = sorobanrpc.NewClient(rpcURL)
+	callCfg := handlers.ContractCallConfig{
+		Callers:  sorobanCallersFromEnv(),
+		CacheTTL: time.Duration(envInt("CONTRACT_CALL_CACHE_TTL_SECONDS", 5)) * time.Second,
 	}
-	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
+	if redisClient != nil {
+		callCfg.SimulationAllowed = middleware.NewSimulationBudget(redisClient, int64(envInt("CONTRACT_CALL_SIMS_PER_MINUTE", 30)))
+	}
+	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContractWith(callCfg))
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
@@ -321,9 +336,9 @@ func main() {
 	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
-	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
+	mux.Handle("/ws", middleware.WSConnectionLimit(streamLimiter(ws.Handler(hub))))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
-	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
+	mux.Handle("/graphql", middleware.WSConnectionLimit(streamLimiter(ws.GraphQLHandler(hub, keyValidator))))
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 

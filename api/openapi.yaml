@@ -1301,7 +1301,30 @@ components:
         Rate limit exceeded for this API key's tier (error.code
         RATE_LIMITED). Carries the same X-RateLimit-* headers as a
         successful response (X-RateLimit-Remaining is 0) plus Retry-After.
+        When a daily or monthly request quota is exhausted the error.code is
+        QUOTA_EXCEEDED instead, with X-Quota-{Daily,Monthly}-{Limit,Remaining,Reset}
+        headers (Reset is a Unix timestamp) and Retry-After set to the reset.
+        Concurrent WebSocket/GraphQL/SSE stream caps per key also return 429
+        RATE_LIMITED.
       headers:
+        X-Quota-Daily-Limit:
+          description: Daily request quota for this key's tier (absent when unlimited).
+          schema: { type: integer }
+        X-Quota-Daily-Remaining:
+          description: Requests left in the current UTC day.
+          schema: { type: integer }
+        X-Quota-Daily-Reset:
+          description: Unix time the daily quota resets (next UTC midnight).
+          schema: { type: integer }
+        X-Quota-Monthly-Limit:
+          description: Monthly request quota for this key's tier (absent when unlimited).
+          schema: { type: integer }
+        X-Quota-Monthly-Remaining:
+          description: Requests left in the current UTC month.
+          schema: { type: integer }
+        X-Quota-Monthly-Reset:
+          description: Unix time the monthly quota resets (first of next UTC month).
+          schema: { type: integer }
         X-RateLimit-Limit:
           $ref: "#/components/headers/X-RateLimit-Limit"
         X-RateLimit-Remaining:

@@ -40,6 +40,7 @@ try {
 | `UNAUTHORIZED`     | 401          | `X-API-Key` header is missing or the key value is not recognised.          |
 | `FORBIDDEN`        | 403          | API key is valid but does not have permission for this endpoint or tier.   |
 | `RATE_LIMITED`     | 429          | Too many requests in the sliding window. Check `retryAfterSeconds`.        |
+| `QUOTA_EXCEEDED`    | 429          | Daily or monthly request quota exhausted. Check `retryAfterSeconds` (time to reset). |
 | `INVALID_ARGUMENT` | 400          | A parameter failed validation (e.g. malformed UUID, out-of-range limit).   |
 | `UNAVAILABLE`      | 503          | The API or indexer is temporarily unavailable.                              |
 | `ITERATION_LIMIT`  | —            | `iterEvents` hit its `maxPages` cap before `hasMore` became false.         |
