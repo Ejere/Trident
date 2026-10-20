@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -105,11 +108,24 @@ fn validate_start_id(start_id: &str) -> Result<String, Status> {
 pub struct EventsServiceImpl {
     pub db: PgPool,
     pub redis: redis::aio::ConnectionManager,
+    redis_client: redis::Client,
+    hub: tokio::sync::OnceCell<Arc<StreamHub>>,
 }
 
 impl EventsServiceImpl {
-    pub fn new(db: PgPool, redis: redis::aio::ConnectionManager) -> Self {
-        Self { db, redis }
+    /// `redis_client` opens the hub's dedicated blocking connection, so its
+    /// XREAD never stalls replay reads on the shared `redis` manager.
+    pub fn new(
+        db: PgPool,
+        redis: redis::aio::ConnectionManager,
+        redis_client: redis::Client,
+    ) -> Self {
+        Self {
+            db,
+            redis,
+            redis_client,
+            hub: tokio::sync::OnceCell::new(),
+        }
     }
 }
 
@@ -208,7 +224,7 @@ fn resolve_network(network: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
-// Redis stream consumer (issue #236)
+// Redis stream fan-out (issues #236, #742)
 // ---------------------------------------------------------------------------
 
 /// What one subscriber asked for.
@@ -234,86 +250,325 @@ fn entry_field(entry: &redis::streams::StreamId, field: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Consume the indexer's Redis stream and push matching events to one
-/// subscriber until the client goes away.
-///
-/// Returns as soon as the receiving half is dropped — including while parked in
-/// a blocking XREAD — so a disconnected client leaves no task behind.
-async fn run_stream_consumer(
-    mut redis: redis::aio::ConnectionManager,
-    tx: tokio::sync::mpsc::Sender<Result<Event, Status>>,
-    subscription: StreamSubscription,
-) {
-    let StreamSubscription {
-        contract_id,
-        topic_0,
-        start_id,
-    } = subscription;
-    let mut last_id = start_id;
+fn entry_topics(entry: &redis::streams::StreamId) -> Vec<String> {
+    serde_json::from_str(&entry_field(entry, "topics")).unwrap_or_default()
+}
 
+fn entry_to_event(entry: &redis::streams::StreamId, topics: Vec<String>) -> Event {
+    Event {
+        id: String::new(),
+        contract_id: entry_field(entry, "contract_id"),
+        ledger_sequence: entry_field(entry, "ledger_sequence").parse().unwrap_or(0),
+        ledger_timestamp: entry_field(entry, "ledger_timestamp"),
+        transaction_hash: entry_field(entry, "transaction_hash"),
+        event_index: entry_field(entry, "event_index").parse().unwrap_or(0),
+        event_type: entry_field(entry, "event_type"),
+        topics,
+        data: entry_field(entry, "data"),
+        created_at: String::new(),
+    }
+}
+
+fn topic_matches(topic_0: &Option<String>, topics: &[String]) -> bool {
+    match topic_0 {
+        Some(t0) => topics.first().map(String::as_str) == Some(t0.as_str()),
+        None => true,
+    }
+}
+
+/// Parse a `<millis>-<seq>` stream id for ordering comparisons.
+fn parse_stream_id(id: &str) -> (u64, u64) {
+    let (ms, seq) = id.split_once('-').unwrap_or((id, "0"));
+    (ms.parse().unwrap_or(0), seq.parse().unwrap_or(0))
+}
+
+struct Subscriber {
+    id: u64,
+    topic_0: Option<String>,
+    tx: tokio::sync::mpsc::Sender<Event>,
+    /// Set when the hub dropped this subscriber because its buffer was full,
+    /// so the forwarder can tell a slow client from a disconnected one.
+    overflowed: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct HubState {
+    /// Id of the last stream entry the hub has dispatched.
+    pos: String,
+    next_id: u64,
+    subs: HashMap<String, Vec<Subscriber>>,
+}
+
+impl HubState {
+    /// Hand one batch of entries to the matching subscribers. Never awaits: a
+    /// subscriber whose buffer is full is dropped rather than stalling the
+    /// single reader (and with it every other subscriber).
+    fn dispatch(&mut self, entries: &[redis::streams::StreamId]) {
+        for entry in entries {
+            self.pos = entry.id.clone();
+
+            let contract_id = entry_field(entry, "contract_id");
+            let Some(list) = self.subs.get_mut(&contract_id) else {
+                continue;
+            };
+
+            let topics = entry_topics(entry);
+            let event = entry_to_event(entry, topics.clone());
+            list.retain(|sub| {
+                if !topic_matches(&sub.topic_0, &topics) {
+                    return true;
+                }
+                match sub.tx.try_send(event.clone()) {
+                    Ok(()) => true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        sub.overflowed.store(true, Ordering::Release);
+                        false
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                }
+            });
+            if list.is_empty() {
+                self.subs.remove(&contract_id);
+            }
+        }
+    }
+
+    fn remove(&mut self, contract_id: &str, id: u64) {
+        if let Some(list) = self.subs.get_mut(contract_id) {
+            list.retain(|s| s.id != id);
+            if list.is_empty() {
+                self.subs.remove(contract_id);
+            }
+        }
+    }
+}
+
+/// One Redis reader per process, fanning stream entries out to subscribers by
+/// contract. Redis read volume is independent of the subscriber count
+/// (issue #742); each subscriber only costs a bounded in-memory channel.
+pub struct StreamHub {
+    state: Arc<Mutex<HubState>>,
+    /// Non-blocking connection used for replaying history to resuming clients.
+    replay: redis::aio::ConnectionManager,
+}
+
+impl StreamHub {
+    /// Start the reader on `reader`, a connection dedicated to blocking XREAD.
+    /// The reader stops once the hub and all of its subscribers are gone.
+    pub async fn start(
+        mut reader: redis::aio::ConnectionManager,
+        replay: redis::aio::ConnectionManager,
+    ) -> redis::RedisResult<Arc<Self>> {
+        let tail: redis::streams::StreamRangeReply = redis::cmd("XREVRANGE")
+            .arg(REDIS_STREAM_KEY)
+            .arg("+")
+            .arg("-")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(&mut reader)
+            .await?;
+        let pos = tail
+            .ids
+            .first()
+            .map(|e| e.id.clone())
+            .unwrap_or_else(|| "0-0".to_string());
+
+        let state = Arc::new(Mutex::new(HubState {
+            pos,
+            ..HubState::default()
+        }));
+        tokio::spawn(run_hub_reader(reader, Arc::downgrade(&state)));
+        Ok(Arc::new(Self { state, replay }))
+    }
+
+    /// Register a subscriber and spawn its forwarder. Events reach `out`; the
+    /// forwarder exits (and unregisters) as soon as `out`'s receiver is dropped.
+    fn subscribe(
+        &self,
+        sub: StreamSubscription,
+        out: tokio::sync::mpsc::Sender<Result<Event, Status>>,
+    ) {
+        let StreamSubscription {
+            contract_id,
+            topic_0,
+            start_id,
+        } = sub;
+        let (live_tx, live_rx) = tokio::sync::mpsc::channel(stream_channel_buffer());
+        let overflowed = Arc::new(AtomicBool::new(false));
+
+        // Registering and snapshotting `pos` under one lock means everything the
+        // hub dispatches from now on has an id above `live_after`, and anything
+        // at or below it is the replay's job.
+        let (sub_id, live_after) = {
+            let mut st = self.state.lock().expect("hub state poisoned");
+            let id = st.next_id;
+            st.next_id += 1;
+            st.subs
+                .entry(contract_id.clone())
+                .or_default()
+                .push(Subscriber {
+                    id,
+                    topic_0: topic_0.clone(),
+                    tx: live_tx,
+                    overflowed: overflowed.clone(),
+                });
+            (id, st.pos.clone())
+        };
+
+        let replay_from = (start_id != STREAM_ID_LIVE_TAIL).then_some(start_id);
+        tokio::spawn(forward_subscriber(Forwarder {
+            state: self.state.clone(),
+            replay: self.replay.clone(),
+            contract_id,
+            topic_0,
+            sub_id,
+            live_after,
+            replay_from,
+            overflowed,
+            live_rx,
+            out,
+        }));
+    }
+}
+
+/// The single XREAD loop. Holds only a weak reference to the state so it ends
+/// once the hub is dropped and no forwarder is left.
+async fn run_hub_reader(mut redis: redis::aio::ConnectionManager, state: Weak<Mutex<HubState>>) {
     let opts = StreamReadOptions::default()
         .block(XREAD_BLOCK_MS)
         .count(100);
 
     loop {
-        let ids = [last_id.clone()];
-        let reply: redis::RedisResult<StreamReadReply> = tokio::select! {
-            biased;
-            _ = tx.closed() => return,
-            reply = redis.xread_options(&[REDIS_STREAM_KEY], &ids, &opts) => reply,
+        let Some(strong) = state.upgrade() else {
+            return;
         };
+        let pos = strong.lock().expect("hub state poisoned").pos.clone();
+        drop(strong);
+
+        let reply: redis::RedisResult<StreamReadReply> = redis
+            .xread_options(&[REDIS_STREAM_KEY], &[pos], &opts)
+            .await;
 
         match reply {
             Ok(StreamReadReply { keys }) => {
+                let Some(strong) = state.upgrade() else {
+                    return;
+                };
+                let mut st = strong.lock().expect("hub state poisoned");
                 for stream_key in keys {
-                    for entry in stream_key.ids {
-                        last_id = entry.id.clone();
-
-                        if entry_field(&entry, "contract_id") != contract_id {
-                            continue;
-                        }
-
-                        let topics: Vec<String> =
-                            serde_json::from_str(&entry_field(&entry, "topics"))
-                                .unwrap_or_default();
-
-                        if let Some(ref t0) = topic_0 {
-                            if topics.first().map(String::as_str) != Some(t0.as_str()) {
-                                continue;
-                            }
-                        }
-
-                        let event = Event {
-                            id: String::new(),
-                            contract_id: entry_field(&entry, "contract_id"),
-                            ledger_sequence: entry_field(&entry, "ledger_sequence")
-                                .parse()
-                                .unwrap_or(0),
-                            ledger_timestamp: entry_field(&entry, "ledger_timestamp"),
-                            transaction_hash: entry_field(&entry, "transaction_hash"),
-                            event_index: entry_field(&entry, "event_index").parse().unwrap_or(0),
-                            event_type: entry_field(&entry, "event_type"),
-                            topics,
-                            data: entry_field(&entry, "data"),
-                            created_at: String::new(),
-                        };
-
-                        // Blocks once the bounded buffer fills, which is the
-                        // backpressure: a slow client stops us reading Redis
-                        // rather than growing an unbounded queue.
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
+                    st.dispatch(&stream_key.ids);
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Redis XREAD error in stream_events, retrying");
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    _ = tx.closed() => return,
+                tracing::warn!(error = %e, "Redis XREAD error in stream hub, retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+struct Forwarder {
+    state: Arc<Mutex<HubState>>,
+    replay: redis::aio::ConnectionManager,
+    contract_id: String,
+    topic_0: Option<String>,
+    sub_id: u64,
+    live_after: String,
+    /// `Some(id)` replays retained history after `id` before going live.
+    replay_from: Option<String>,
+    overflowed: Arc<AtomicBool>,
+    live_rx: tokio::sync::mpsc::Receiver<Event>,
+    out: tokio::sync::mpsc::Sender<Result<Event, Status>>,
+}
+
+/// Feed one subscriber: replay history up to the hub position it registered at,
+/// then forward live events. Backpressure is the bounded `out` channel; when it
+/// stays full the hub drops the subscriber instead of buffering without limit.
+async fn forward_subscriber(mut f: Forwarder) {
+    forward_inner(&mut f).await;
+    f.state
+        .lock()
+        .expect("hub state poisoned")
+        .remove(&f.contract_id, f.sub_id);
+}
+
+async fn forward_inner(f: &mut Forwarder) {
+    if let Some(mut last_id) = f.replay_from.take() {
+        let opts = StreamReadOptions::default().count(100);
+        let live_after = parse_stream_id(&f.live_after);
+        loop {
+            let ids = [last_id.clone()];
+            let reply: redis::RedisResult<StreamReadReply> = tokio::select! {
+                biased;
+                _ = f.out.closed() => return,
+                reply = f.replay.xread_options(&[REDIS_STREAM_KEY], &ids, &opts) => reply,
+            };
+            let keys = match reply {
+                Ok(reply) => reply.keys,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Redis XREAD error replaying stream history");
+                    let _ = f
+                        .out
+                        .send(Err(Status::unavailable(
+                            "event stream temporarily unavailable",
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let entries: Vec<_> = keys.into_iter().flat_map(|k| k.ids).collect();
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                if parse_stream_id(&entry.id) > live_after {
+                    // The hub delivers everything past this point.
+                    return forward_live(f).await;
+                }
+                last_id = entry.id.clone();
+                if entry_field(&entry, "contract_id") != f.contract_id {
+                    continue;
+                }
+                let topics = entry_topics(&entry);
+                if !topic_matches(&f.topic_0, &topics) {
+                    continue;
+                }
+                if f.out
+                    .send(Ok(entry_to_event(&entry, topics)))
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
+        }
+    }
+    forward_live(f).await;
+}
+
+async fn forward_live(f: &mut Forwarder) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = f.out.closed() => return,
+            event = f.live_rx.recv() => match event {
+                Some(event) => {
+                    if f.out.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+                None => {
+                    if f.overflowed.load(Ordering::Acquire) {
+                        let _ = f
+                            .out
+                            .send(Err(Status::resource_exhausted(
+                                "subscriber too slow; stream dropped",
+                            )))
+                            .await;
+                    }
+                    return;
+                }
+            },
         }
     }
 }
@@ -496,15 +751,30 @@ impl Events for EventsServiceImpl {
 
         let (tx, rx) = tokio::sync::mpsc::channel(stream_channel_buffer());
 
-        tokio::spawn(run_stream_consumer(
-            self.redis.clone(),
-            tx,
+        // The entered span guard is not `Send`, so it cannot live across the
+        // awaits below.
+        drop(_entered);
+
+        let hub = self
+            .hub
+            .get_or_try_init(|| async {
+                let reader = self.redis_client.get_connection_manager().await?;
+                StreamHub::start(reader, self.redis.clone()).await
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to start stream hub");
+                Status::unavailable("event stream temporarily unavailable")
+            })?;
+
+        hub.subscribe(
             StreamSubscription {
                 contract_id,
                 topic_0: topic_0_filter,
                 start_id: last_id,
             },
-        ));
+            tx,
+        );
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
@@ -542,12 +812,9 @@ mod tests {
 
     async fn make_svc(db_url: &str, redis_url: &str) -> EventsServiceImpl {
         let db = PgPool::connect(db_url).await.unwrap();
-        let redis = redis::Client::open(redis_url)
-            .unwrap()
-            .get_connection_manager()
-            .await
-            .unwrap();
-        EventsServiceImpl::new(db, redis)
+        let client = redis::Client::open(redis_url).unwrap();
+        let redis = client.get_connection_manager().await.unwrap();
+        EventsServiceImpl::new(db, redis, client)
     }
 
     async fn seed_events(pool: &PgPool, contract_id: &str, network: &str, count: usize) {
@@ -984,35 +1251,151 @@ mod tests {
         );
     }
 
+    async fn xadd_event(conn: &mut redis::aio::MultiplexedConnection, contract: &str, seq: u32) {
+        let _: String = redis::cmd("XADD")
+            .arg(REDIS_STREAM_KEY)
+            .arg("*")
+            .arg("contract_id")
+            .arg(contract)
+            .arg("ledger_sequence")
+            .arg(seq)
+            .arg("ledger_timestamp")
+            .arg("2024-01-01T00:00:00Z")
+            .arg("transaction_hash")
+            .arg("txhub")
+            .arg("event_index")
+            .arg("0")
+            .arg("event_type")
+            .arg("contract")
+            .arg("topics")
+            .arg(r#"["transfer"]"#)
+            .arg("data")
+            .arg("null")
+            .query_async(conn)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
-    async fn dropping_the_receiver_stops_the_consumer() {
-        let (_db_url, redis_url) = require_services!();
-        let redis = redis::Client::open(redis_url.as_str())
+    async fn dropping_the_receiver_unregisters_the_subscriber() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(StreamEventsRequest {
+            contract_id: "CTEST_CANCEL".to_string(),
+            topic_0: String::new(),
+            start_id: String::new(),
+        });
+        let stream = svc.stream_events(req).await.unwrap().into_inner();
+        let hub = svc.hub.get().unwrap().clone();
+        assert!(hub.state.lock().unwrap().subs.contains_key("CTEST_CANCEL"));
+
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while hub.state.lock().unwrap().subs.contains_key("CTEST_CANCEL") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("subscriber was not unregistered after the receiver was dropped");
+    }
+
+    /// Redis read volume must not grow with the number of subscribers: one
+    /// reader serves them all (issue #742). Compares the XREAD calls and bytes
+    /// Redis serves for the same publish workload at 10 vs 1,000 subscribers on
+    /// distinct contracts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redis_read_volume_is_independent_of_subscriber_count() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+        let mut admin = redis::Client::open(redis_url.as_str())
             .unwrap()
-            .get_connection_manager()
+            .get_multiplexed_async_connection()
             .await
             .unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let handle = tokio::spawn(run_stream_consumer(
-            redis,
-            tx,
-            StreamSubscription {
-                contract_id: "CTEST_CANCEL".to_string(),
-                topic_0: None,
-                start_id: "$".to_string(),
-            },
-        ));
+        async fn xread_stats(conn: &mut redis::aio::MultiplexedConnection) -> (u64, u64) {
+            let stats: String = redis::cmd("INFO")
+                .arg("commandstats")
+                .query_async(conn)
+                .await
+                .unwrap();
+            let calls = stats
+                .lines()
+                .find(|l| l.starts_with("cmdstat_xread:"))
+                .and_then(|l| l.split("calls=").nth(1))
+                .and_then(|r| r.split(',').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            let server: String = redis::cmd("INFO")
+                .arg("stats")
+                .query_async(conn)
+                .await
+                .unwrap();
+            let out = server
+                .lines()
+                .find(|l| l.starts_with("total_net_output_bytes:"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0);
+            (calls, out)
+        }
 
-        // Let the consumer park inside a blocking XREAD first.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        drop(rx);
+        let measure = |subscribers: usize| {
+            let svc = &svc;
+            async move {
+                let mut streams = Vec::new();
+                for i in 0..subscribers {
+                    let req = Request::new(StreamEventsRequest {
+                        contract_id: format!("CLOAD_{subscribers}_{i}"),
+                        topic_0: String::new(),
+                        start_id: String::new(),
+                    });
+                    streams.push(svc.stream_events(req).await.unwrap().into_inner());
+                }
+                streams
+            }
+        };
 
-        // It selects on tx.closed(), so it must return well inside one XREAD
-        // block window (5s) rather than idling until that read returns.
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        let mut publisher = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
             .await
-            .expect("consumer did not stop after the receiver was dropped")
-            .expect("consumer task panicked");
+            .unwrap();
+
+        let mut results = Vec::new();
+        for subscribers in [10usize, 1_000] {
+            let streams = measure(subscribers).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let (calls_before, bytes_before) = xread_stats(&mut admin).await;
+            for n in 0..200u32 {
+                xadd_event(
+                    &mut publisher,
+                    &format!("CLOAD_{subscribers}_{}", n as usize % subscribers),
+                    n,
+                )
+                .await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let (calls_after, bytes_after) = xread_stats(&mut admin).await;
+
+            results.push((calls_after - calls_before, bytes_after - bytes_before));
+            drop(streams);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let (small_calls, small_bytes) = results[0];
+        let (large_calls, large_bytes) = results[1];
+        eprintln!("10 subs: {small_calls} XREAD calls, {small_bytes} bytes; 1000 subs: {large_calls} XREAD calls, {large_bytes} bytes");
+        assert!(
+            large_calls <= small_calls * 2 + 5,
+            "XREAD calls grew with subscribers: {small_calls} -> {large_calls}"
+        );
+        assert!(
+            large_bytes <= small_bytes * 2 + 50_000,
+            "Redis output bytes grew with subscribers: {small_bytes} -> {large_bytes}"
+        );
     }
 }

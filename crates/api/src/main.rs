@@ -85,16 +85,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(pool_size, "Database connected via pool");
 
     let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL is required");
-    let redis_manager = redis::Client::open(redis_url)?
-        .get_connection_manager()
-        .await?;
+    let redis_client = redis::Client::open(redis_url)?;
+    let redis_manager = redis_client.get_connection_manager().await?;
     tracing::info!("Redis connected");
 
     let addr: SocketAddr = cfg.grpc_addr.parse()?;
 
     tracing::info!(%addr, "Trident gRPC server listening");
 
-    let events_service = services::events::EventsServiceImpl::new(db_pool, redis_manager);
+    let events_service =
+        services::events::EventsServiceImpl::new(db_pool, redis_manager, redis_client);
 
     let mut server_builder = tonic::transport::Server::builder();
 
