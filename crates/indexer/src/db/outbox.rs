@@ -13,7 +13,7 @@
 //! entry) — exactly-once is explicitly not the target.
 
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use trident_common::{SorobanEvent, TridentError};
 use uuid::Uuid;
 
@@ -37,12 +37,17 @@ impl OutboxRecord {
     }
 }
 
-/// Fetch the oldest unpublished rows in insertion order.
+/// Claim the oldest unpublished rows in insertion order.
+///
+/// Rows are locked with `FOR UPDATE SKIP LOCKED` until the surrounding
+/// transaction ends, so concurrent relays partition the backlog instead of
+/// publishing the same rows twice (issue #740). The caller must keep the
+/// transaction open through publish and [`mark_published`].
 ///
 /// `limit` bounds the batch so the relay can never monopolise the database or
 /// starve the poll loop.
 pub async fn fetch_unpublished(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     limit: i64,
 ) -> Result<Vec<OutboxRecord>, TridentError> {
     let rows: Vec<(i64, Uuid, Value)> = sqlx::query_as(
@@ -52,10 +57,11 @@ pub async fn fetch_unpublished(
         WHERE published = FALSE
         ORDER BY seq
         LIMIT $1
+        FOR UPDATE SKIP LOCKED
         "#,
     )
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(conn)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("fetch_unpublished")))?;
 
@@ -74,7 +80,7 @@ pub async fn fetch_unpublished(
 /// Called only after a successful `XADD`. A crash between the publish and this
 /// update re-delivers those events on the next relay pass, which is safe
 /// because consumers dedupe by event id.
-pub async fn mark_published(pool: &PgPool, seqs: &[i64]) -> Result<(), TridentError> {
+pub async fn mark_published(conn: &mut PgConnection, seqs: &[i64]) -> Result<(), TridentError> {
     if seqs.is_empty() {
         return Ok(());
     }
@@ -87,7 +93,7 @@ pub async fn mark_published(pool: &PgPool, seqs: &[i64]) -> Result<(), TridentEr
         "#,
     )
     .bind(seqs)
-    .execute(pool)
+    .execute(conn)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("mark_published")))?;
 
