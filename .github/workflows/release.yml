@@ -152,6 +152,8 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     strategy:
       fail-fast: false
       matrix:
@@ -173,6 +175,9 @@ jobs:
 
       - name: Set up QEMU (cross-platform emulation)
         uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3 # v3.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
 
       - name: Log in to GHCR
         uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20 # v3.1.0
@@ -211,6 +216,28 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
+      # Issue #780: one SBOM/attest pair per matrix image, generalized from
+      # four near-identical per-image jobs this release workflow used to
+      # carry (build-images for indexer only, plus separate build-grpc-api /
+      # build-go-api / build-migrate jobs, each repeating the same five
+      # sign/SBOM/attest steps against a hardcoded image name).
+      - name: Generate SBOM
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.17.2
+        with:
+          image: "${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image }}@${{ steps.push.outputs.digest }}"
+          format: spdx-json
+          output-file: ${{ matrix.image }}-sbom.spdx.json
+
+      - name: Attest SBOM
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate ${{ matrix.image }}-sbom.spdx.json \
+            "${IMAGE}@${DIGEST}"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
         with:
@@ -231,7 +258,6 @@ jobs:
           path: digest-${{ matrix.image }}.txt
           retention-days: 7
 
-  # ---------------------------------------------------------------------------
   # Publish SDKs to their registries -- all of them on a tag, or the one chosen
   # on manual dispatch. This is the single place the TypeScript SDK is
   # published from (release.yml used to publish it a second time).

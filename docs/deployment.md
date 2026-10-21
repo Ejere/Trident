@@ -915,6 +915,49 @@ fly releases -a trident-api          # list releases
 fly deploy --image-label <version> -a trident-api  # roll back to a specific release
 ```
 
+### Verifying release image signatures and provenance
+
+Every image `.github/workflows/release.yml` pushes to GHCR
+(`trident-indexer`, `trident-grpc-api`, `trident-go-api`, `trident-migrate`)
+is keyless-signed with [cosign](https://docs.sigstore.dev/) using the
+release workflow's own GitHub OIDC identity, and carries a
+[SLSA build provenance attestation](https://slsa.dev/) plus an SPDX SBOM
+attestation (issue #780). Nothing is signed with a private key stored in
+this repository or in secrets — verification ties the image back to
+*this* workflow run, not to an operator-held key.
+
+Before deploying an image to mainnet, verify both the signature and the
+provenance came from this repository's release workflow on the expected
+ref:
+
+```bash
+IMAGE=ghcr.io/telocel-labs/trident-go-api@sha256:<digest>
+
+# Signature: was this image signed by the release workflow?
+cosign verify "$IMAGE" \
+  --certificate-identity-regexp 'https://github.com/Telocel-Labs/Trident/\.github/workflows/release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Build provenance: was it actually built by that workflow run (not just
+# signed after the fact by someone else with repo write access)?
+gh attestation verify "$IMAGE" --repo Telocel-Labs/Trident
+
+# SBOM: inspect what's inside the image.
+cosign download attestation "$IMAGE" --predicate-type spdxjson | \
+  jq -r '.payload' | base64 -d | jq '.predicate'
+```
+
+A locally built image (or one pushed by any workflow other than
+`release.yml`) has no matching attestation and both `cosign verify` and
+`gh attestation verify` fail closed.
+
+An admission-policy example (e.g. for an OPA/Gatekeeper or Kyverno policy
+enforcing `cosign verify` on image pull in a Kubernetes cluster) is out of
+scope for this repo's own Helm chart, which is deployed by its operator
+rather than by Trident itself — point the policy's
+`certificate-identity-regexp`/`certificate-oidc-issuer` at the same values
+used above.
+
 ---
 
 ## Distributed Tracing (OpenTelemetry)
