@@ -6,7 +6,20 @@ primary_region = "iad"
   dockerfile = "crates/indexer/Dockerfile"
 
 [env]
-  POLL_INTERVAL_MS  = "5000"
+  # POLL_INTERVAL_MS is no longer read by the poll loop; setting it is now a
+  # hard startup error that crash-loops the deploy (issue #777;
+  # crates/indexer/src/config.rs:276-281). The adaptive poll interval is
+  # controlled by the floor/ceiling pair instead — 5000/5000 reproduces the
+  # fixed 5s cadence this app previously ran under POLL_INTERVAL_MS.
+  POLL_INTERVAL_FLOOR_MS   = "5000"
+  POLL_INTERVAL_CEILING_MS = "5000"
+  # Explicit rather than relying on the "testnet" default (issue #777), so a
+  # `fly deploy` here can never silently index the wrong network regardless
+  # of what NETWORK defaults to in the future. Change to "mainnet" (and set
+  # the STELLAR_RPC_URL secret to a mainnet-capable provider — see
+  # docs/deployment.md#testnet-vs-mainnet-configuration) when this app is
+  # promoted to mainnet.
+  NETWORK           = "testnet"
   INDEX_DIAGNOSTIC  = "false"
   METRICS_PORT      = "9090"
   # crates/indexer/src/health.rs serves /healthz and /readyz on this port,
@@ -19,8 +32,6 @@ primary_region = "iad"
 # Secrets are sourced exclusively from Fly's encrypted secrets store
 # (set via: fly secrets set -a trident-indexer KEY=value), never from [env].
 # Required: DATABASE_URL, REDIS_URL, STELLAR_RPC_URL (or STELLAR_RPC_URLS)
-# Optional (defaults to "testnet" if unset — crates/indexer/src/config.rs):
-# NETWORK
 
 # No public HTTP — indexer is a worker process. Both the Prometheus listener
 # and the health/readiness listener are reachable only on the private 6PN

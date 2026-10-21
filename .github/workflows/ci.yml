@@ -619,7 +619,6 @@ jobs:
           sys.exit(1 if failed else 0)
           PY
 
-  # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
   helm:
@@ -751,6 +750,12 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       - name: Check every env var the code reads is documented
         run: bash scripts/check-env-reference.sh
+
+      # Catches fly/*.toml setting an env var the indexer now hard-rejects
+      # at startup — exactly how POLL_INTERVAL_MS crash-looped every Fly
+      # deploy after #629 (issue #777).
+      - name: Check Fly configs don't set a rejected env var
+        run: bash scripts/check-fly-env-rejected.sh
 
       # Catches two migrations sharing a version prefix before it reaches a
       # real database. The rust-integration job applies migrations with a
