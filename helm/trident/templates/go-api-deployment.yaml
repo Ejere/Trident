@@ -105,6 +105,13 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+            {{- if .Values.goApi.trustedProxyCIDRs }}
+            # Comma-separated CIDRs of the proxies (nginx's pod IP) allowed
+            # to be walked past in X-Forwarded-For (issue #779). See
+            # services/api/middleware/abuse.go (trustedClientIP).
+            - name: TRUSTED_PROXY_CIDRS
+              value: {{ join "," .Values.goApi.trustedProxyCIDRs | quote }}
+            {{- end }}
           livenessProbe:
             {{- toYaml .Values.goApi.livenessProbe | nindent 12 }}
           readinessProbe:

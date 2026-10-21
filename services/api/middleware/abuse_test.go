@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -157,19 +158,77 @@ func TestTrustedClientIP_UntrustedByDefault(t *testing.T) {
 	req.RemoteAddr = "9.9.9.9:5555"
 	req.Header.Set("X-Forwarded-For", "1.1.1.1, 2.2.2.2")
 
-	if ip := trustedClientIP(req, false); ip != "9.9.9.9" {
+	if ip := trustedClientIP(req, false, nil); ip != "9.9.9.9" {
 		t.Fatalf("expected RemoteAddr host 9.9.9.9 when proxy headers are untrusted, got %q", ip)
 	}
 }
 
-func TestTrustedClientIP_TrustsLastHopOnly(t *testing.T) {
+func TestTrustedClientIP_TrustsLastHopOnly_NoCIDRsConfigured(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
 	req.RemoteAddr = "9.9.9.9:5555"
 	req.Header.Set("X-Forwarded-For", "1.1.1.1, 2.2.2.2")
 
-	// Only the last entry (the one the trusted proxy itself appended) is used.
-	if ip := trustedClientIP(req, true); ip != "2.2.2.2" {
+	// Legacy behaviour when no CIDRs are configured: only the last entry is used.
+	if ip := trustedClientIP(req, true, nil); ip != "2.2.2.2" {
 		t.Fatalf("expected last XFF hop 2.2.2.2, got %q", ip)
+	}
+}
+
+func TestTrustedClientIP_FlyClientIPTakesPriority(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.RemoteAddr = "9.9.9.9:5555"
+	req.Header.Set("Fly-Client-IP", "3.3.3.3")
+	req.Header.Set("X-Forwarded-For", "1.1.1.1, 2.2.2.2")
+
+	if ip := trustedClientIP(req, true, nil); ip != "3.3.3.3" {
+		t.Fatalf("expected Fly-Client-IP 3.3.3.3 to win, got %q", ip)
+	}
+}
+
+func TestTrustedClientIP_FlyClientIPIgnoredWhenNotTrusting(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.RemoteAddr = "9.9.9.9:5555"
+	req.Header.Set("Fly-Client-IP", "3.3.3.3")
+
+	if ip := trustedClientIP(req, false, nil); ip != "9.9.9.9" {
+		t.Fatalf("expected RemoteAddr host when proxy headers are untrusted, got %q", ip)
+	}
+}
+
+func TestTrustedClientIP_WalksPastTrustedCIDRs(t *testing.T) {
+	_, nginxCIDR, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	cidrs := []*net.IPNet{nginxCIDR}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	// The immediate peer (nginx) is inside the trusted CIDR.
+	req.RemoteAddr = "10.0.0.5:5555"
+	// client, then the load balancer (also in-CIDR since it sits in the
+	// cluster's private range here), then nginx's own appended hop.
+	req.Header.Set("X-Forwarded-For", "1.1.1.1, 10.0.0.9, 10.0.0.5")
+
+	if ip := trustedClientIP(req, true, cidrs); ip != "1.1.1.1" {
+		t.Fatalf("expected real client IP 1.1.1.1 after walking past trusted hops, got %q", ip)
+	}
+}
+
+func TestTrustedClientIP_IgnoresXFFWhenPeerNotTrusted(t *testing.T) {
+	_, nginxCIDR, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	cidrs := []*net.IPNet{nginxCIDR}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	// Peer is NOT in the trusted range — a client connecting directly and
+	// forging XFF must not be able to pick its own rate-limit bucket.
+	req.RemoteAddr = "8.8.8.8:5555"
+	req.Header.Set("X-Forwarded-For", "1.1.1.1")
+
+	if ip := trustedClientIP(req, true, cidrs); ip != "8.8.8.8" {
+		t.Fatalf("expected RemoteAddr 8.8.8.8 when peer is untrusted, got %q", ip)
 	}
 }
 

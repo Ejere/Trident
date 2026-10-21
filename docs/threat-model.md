@@ -97,12 +97,17 @@ Key implications:
   internal-only in any deployment.
 - **nginx's `X-Forwarded-For`** is a boundary in itself: nginx *appends* to
   any client-supplied XFF rather than replacing it
-  (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`), so only
-  the last hop is trustworthy. See the per-IP rate limiter's trust-assumption
-  comment (`services/api/middleware/abuse.go`, `trustedClientIP`) — it only
-  reads XFF at all when `TRUSTED_PROXY_ENABLED=true`, which must only be set
-  when nginx (or an equivalent proxy) is confirmed to be the sole path to
-  the API.
+  (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`). The
+  per-IP rate limiter (`services/api/middleware/abuse.go`,
+  `trustedClientIP`) only reads XFF at all when `TRUSTED_PROXY_ENABLED=true`,
+  and (issue #779) walks the chain from the right, skipping only hops whose
+  address falls inside `TRUSTED_PROXY_CIDRS` — the immediate TCP peer must
+  itself be a trusted proxy or the whole header is ignored, so a client that
+  connects directly cannot forge a trusted-looking chain and pick its own
+  rate-limit bucket. On Fly, `Fly-Client-IP` (set by Fly's own edge, not
+  forgeable by the client) is used instead and no CIDR list is needed.
+  `TRUSTED_PROXY_ENABLED` must only be set when nginx/Fly (or an equivalent
+  proxy) is confirmed to be the sole path to the API.
 - **Indexer → Soroban RPC** crosses into semi-trusted territory: the RPC
   endpoint is operator-configured (not arbitrary/attacker-supplied), but its
   *responses* are still untrusted input and are parsed defensively

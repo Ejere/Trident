@@ -16,6 +16,12 @@ primary_region = "iad"
   # (middleware.ValidateIdempotencyEncryptionConfig) instead of each machine
   # silently generating its own per-process key.
   APP_ENV   = "production"
+  # Fly terminates TLS at its edge and sets Fly-Client-IP to the real client
+  # address (issue #779) — this header cannot be set/overridden by the
+  # client itself, so no TRUSTED_PROXY_CIDRS is needed here (that CIDR walk
+  # only applies to the X-Forwarded-For fallback used behind nginx/Helm).
+  # See services/api/middleware/abuse.go (trustedClientIP).
+  TRUSTED_PROXY_ENABLED = "true"
 
 # Secrets are sourced exclusively from Fly's encrypted secrets store
 # (set via: fly secrets set -a trident-api KEY=value), never from [env].

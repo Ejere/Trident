@@ -163,7 +163,8 @@ Variables marked **REQUIRED** must be set before the service starts. Variables m
 | `MAX_IN_FLIGHT_REQUESTS`  | OPTIONAL | integer | `500`       | Global concurrency cap. Requests beyond this many in-flight get `503`. |
 | `PER_IP_RATE_LIMIT_RPS`   | OPTIONAL | integer | `20`        | Per-IP sliding-window request limit, applied before auth. |
 | `PER_IP_RATE_LIMIT_WINDOW_MS`| OPTIONAL | integer | `1000`   | Window (ms) for the per-IP rate limit. |
-| `TRUSTED_PROXY_ENABLED`   | OPTIONAL | boolean | `false`     | Set `true` only when behind the nginx reverse proxy. Resolves client IP from `X-Forwarded-For`. Do NOT enable if untrusted clients can reach the API directly. |
+| `TRUSTED_PROXY_ENABLED`   | OPTIONAL | boolean | `false`     | Set `true` only when behind Fly's edge or the nginx reverse proxy. Resolves client IP from `Fly-Client-IP` or, falling back, `X-Forwarded-For` (walked past `TRUSTED_PROXY_CIDRS` only). Do NOT enable if untrusted clients can reach the API directly. |
+| `TRUSTED_PROXY_CIDRS`     | OPTIONAL | string  | unset       | Comma-separated CIDRs of proxies allowed to be walked past in `X-Forwarded-For`, e.g. `10.0.0.0/8`. Not needed on Fly. |
 
 ### Profiling
 

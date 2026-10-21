@@ -234,12 +234,26 @@ goApi:
     PORT: "3000"
     GRPC_ADDR: "trident-grpc-api:5000"
     METRICS_PORT: "9091"
+    # The Go API is only reachable through the in-cluster nginx deployment
+    # (helm/trident/templates/nginx-deployment.yaml / ingress.yaml, which
+    # routes exclusively to the nginx Service, never straight to go-api).
+    # nginx's own pod IP — the X-Forwarded-For hop this process actually
+    # sees, appended by docker/nginx/nginx.conf's
+    # `proxy_add_x_forwarded_for` — always falls inside the cluster's
+    # private pod/service CIDR, which is RFC1918 space regardless of
+    # CNI/cloud (issue #779). Override trustedProxyCIDRs below if a cluster
+    # uses a non-RFC1918 pod network.
+    TRUSTED_PROXY_ENABLED: "true"
   # Internal Prometheus metrics server (METRICS_PORT, issue #58), separate
   # from the public API port and from the legacy /metrics route mounted on
   # it. Exposed as its own container/Service port so a ServiceMonitor can
   # scrape it without also exposing it on the public-facing port (issue
   # #768). Must match goApi.env.METRICS_PORT above.
   metricsPort: 9091
+  trustedProxyCIDRs:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
   hpa:
     minReplicas: 2
     maxReplicas: 10
