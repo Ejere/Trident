@@ -141,6 +141,15 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
       LOG_LEVEL: ${LOG_LEVEL}
+      # Required when APP_ENV=production: middleware.ValidateIdempotencyEncryptionConfig
+      # fails startup when unset, since without it a retried create landing
+      # on a different replica can't decrypt the first attempt's idempotency
+      # record (services/api/middleware/idempotency.go).
+      APP_ENV: ${APP_ENV:-development}
+      IDEMPOTENCY_ENCRYPTION_KEY: ${IDEMPOTENCY_ENCRYPTION_KEY:-}
+      # Set only while rotating IDEMPOTENCY_ENCRYPTION_KEY — see
+      # docs/deployment.md#rotating-idempotency_encryption_key.
+      IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS: ${IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS:-}
     ports:
       - "${PORT}:${PORT}"
     # Probe /v1/ready (issue #243), not /v1/health — compose's healthcheck

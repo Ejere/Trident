@@ -262,3 +262,40 @@ func TestIdempotency_RedisValueIsEncryptedAtRest(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateIdempotencyEncryptionConfig covers the production fail-fast
+// gate: without a pinned IDEMPOTENCY_ENCRYPTION_KEY, every replica encrypts
+// idempotency records under its own random key, so a retry landing on a
+// different replica can't decrypt the first attempt's record and mints a
+// second resource — this must refuse to start in production instead.
+func TestValidateIdempotencyEncryptionConfig(t *testing.T) {
+	validKey := "ab0123456789ab0123456789ab0123456789ab0123456789ab0123456789ab"
+
+	cases := []struct {
+		name    string
+		appEnv  string
+		key     string
+		wantErr bool
+	}{
+		{name: "non-production, no key", appEnv: "development", key: "", wantErr: false},
+		{name: "non-production, malformed key", appEnv: "development", key: "not-hex", wantErr: false},
+		{name: "production, no key", appEnv: "production", key: "", wantErr: true},
+		{name: "production, malformed key", appEnv: "production", key: "too-short", wantErr: true},
+		{name: "production, valid key", appEnv: "production", key: validKey, wantErr: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("APP_ENV", tc.appEnv)
+			t.Setenv("IDEMPOTENCY_ENCRYPTION_KEY", tc.key)
+
+			err := middleware.ValidateIdempotencyEncryptionConfig()
+			if tc.wantErr && err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+		})
+	}
+}

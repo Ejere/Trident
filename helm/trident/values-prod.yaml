@@ -74,3 +74,11 @@ nginx:
 # external-secrets operator rather than provisioned by hand.
 global:
   existingSecret: trident-secrets
+
+# APP_ENV=production turns on JSON structured logging (services/api/logging.go)
+# and, since it is what ValidateIdempotencyEncryptionConfig checks, makes a
+# missing IDEMPOTENCY_ENCRYPTION_KEY in trident-secrets a startup failure
+# instead of a silently-generated per-replica key (services/api/middleware/idempotency.go).
+goApi:
+  env:
+    APP_ENV: production

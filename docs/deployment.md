@@ -47,6 +47,9 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `LOG_LEVEL` | One of `error`, `warn`, `info`, `debug`, `trace` (use `info` in production) |
 | `PORT` | API listen port (default: `3000`) |
 | `API_KEY_SALT` | Random secret for hashing API keys — **must be changed** |
+| `APP_ENV` | Set `production` in production — enables JSON structured logging and requires `IDEMPOTENCY_ENCRYPTION_KEY` to be set (the API refuses to start otherwise) |
+| `IDEMPOTENCY_ENCRYPTION_KEY` | 64 hex characters (32 bytes), e.g. `openssl rand -hex 32` — encrypts `Idempotency-Key` records at rest in Redis and lets every `api` replica read records any other replica wrote. Required when `APP_ENV=production`; with more than one replica, running without it means a retried `POST /v1/api-keys` or `POST /v1/webhooks` that lands on a different replica (or the same replica after a restart) cannot decrypt the first attempt's record and mints a second credential. See [Rotating `IDEMPOTENCY_ENCRYPTION_KEY`](#rotating-idempotency_encryption_key). |
+| `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` | Optional. Set only while rotating `IDEMPOTENCY_ENCRYPTION_KEY` — see below. |
 | `POSTGRES_USER` | PostgreSQL username |
 | `POSTGRES_PASSWORD` | PostgreSQL password |
 | `POSTGRES_DB` | PostgreSQL database name |
@@ -425,6 +428,33 @@ curl https://your-domain.com/v1/ready
      up -d --no-deps api indexer
    ```
 
+### `IDEMPOTENCY_ENCRYPTION_KEY` {#rotating-idempotency_encryption_key}
+
+Unlike the secrets above, this one supports a no-downtime overlap window:
+`IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` lets every `api` replica keep decrypting
+records written under the old key while new records are written under the
+new one, so an in-flight retry doesn't fail to decrypt mid-rotation.
+
+1. Move the current value of `IDEMPOTENCY_ENCRYPTION_KEY` into
+   `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` in `.env`.
+2. Generate a new key and set it as `IDEMPOTENCY_ENCRYPTION_KEY`:
+   ```bash
+   openssl rand -hex 32
+   ```
+3. Restart every `api` replica (all of them — a replica still running the
+   old binary's env is fine, since it's still the same old key, but every
+   replica must pick up both new env vars before the old key is removed in
+   step 5):
+   ```bash
+   docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
+     up -d --no-deps api
+   ```
+4. Wait at least the idempotency record TTL (`DefaultIdempotencyTTL`, 24h by
+   default) so every record written under the old key has expired.
+5. Remove `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` from `.env` and restart `api`
+   again. Leaving a rotated-out key configured indefinitely keeps a decrypt
+   path open for no benefit.
+
 ---
 
 ## Monitoring
@@ -749,7 +779,8 @@ fly secrets set -a trident-indexer NETWORK="mainnet"
 fly secrets set -a trident-api \
   API_KEY_SALT="$(openssl rand -hex 32)" \
   ADMIN_API_KEY="$(openssl rand -hex 32)" \
-  API_KEY_HASHES="<hex(hmac_sha256(salt, key)) list, comma-separated>"
+  API_KEY_HASHES="<hex(hmac_sha256(salt, key)) list, comma-separated>" \
+  IDEMPOTENCY_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 ```
 `services/api/main.go` does not hard-exit on a missing `DATABASE_URL` or
 `REDIS_URL` — it falls back to `redis://localhost:6379` and serves
@@ -758,6 +789,17 @@ check logs; always set both explicitly in production. `API_KEY_SALT` is
 read by `services/api/middleware/auth.go` to HMAC every incoming API key.
 `API_KEY_HASHES` is the legacy env-var auth allowlist; skip it only if every
 API key is issued through the DB-backed `/v1/admin/keys` endpoints instead.
+`IDEMPOTENCY_ENCRYPTION_KEY` is required because `fly/api.toml` sets
+`APP_ENV=production` in `[env]`, which makes
+`middleware.ValidateIdempotencyEncryptionConfig` exit the process at startup
+if it's unset — `trident-api` runs 2+ machines (see
+[Scaling](#scaling)), and without a shared key one machine can't decrypt an
+idempotency record another machine wrote, letting a retried
+`POST /v1/api-keys` or `POST /v1/webhooks` double-create. See
+[Rotating `IDEMPOTENCY_ENCRYPTION_KEY`](#rotating-idempotency_encryption_key)
+to rotate it without downtime (`fly secrets set` the old value as
+`IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` alongside the new
+`IDEMPOTENCY_ENCRYPTION_KEY`, same procedure otherwise).
 Optional secrets: `STELLAR_RPC_URL` (enables the admin contract-call
 endpoint) and `PGBOUNCER_ADMIN_URL` (enables `GET /v1/admin/db`).
 
@@ -1005,10 +1047,95 @@ following require you to provision them once:
 3. Merging into `main` does not itself deploy anything — production deploys
    are tag-triggered: `git tag vX.Y.Z && git push origin vX.Y.Z` runs
    `release.yml`, which builds and pushes the same three images tagged with
-   that version and `latest` (issue #302).
-4. Roll out to production the same way as any other release — see
-   [Updating (Rolling Update)](#updating-rolling-update) above — pointing
-   `helm/trident/values.yaml` (production defaults, no `-staging` overlay) at
-   the new tag.
+   that version and `latest`, then publishes a GitHub Release (issue #302).
+4. Publishing that Release triggers `production-deploy.yml` automatically
+   (or run it via `workflow_dispatch` with the tag, to promote a specific
+   already-published release by hand) — see
+   [Production Deploy](#production) below for the full gate.
 5. If a smoke test on `dev` fails, treat the branch as un-promotable until
    fixed — do not cut a `main` PR or tag from a red `dev`.
+
+## Production Deploy {#production}
+
+`.github/workflows/production-deploy.yml` promotes a published GitHub
+Release to production through an approval gate — the thing a manual
+`helm upgrade` from someone's laptop never had: a recorded approver, a
+post-deploy smoke test, and automatic rollback on failure.
+
+### Triggers
+
+- **`release: published`** — fires automatically when `release.yml` finishes
+  building images for a `vX.Y.Z` tag and publishes the GitHub Release.
+- **`workflow_dispatch`** with a `tag` input — promote a specific,
+  already-published release by hand (e.g. retrying a promotion after a
+  transient smoke-test failure, without cutting a new release).
+
+### One-time setup: the `production` Environment
+
+The approval gate itself is a GitHub Environment protection rule, which a
+workflow file cannot create — a repo admin configures it once:
+
+1. **Settings → Environments → New environment**, name it `production`.
+2. Under **Deployment protection rules**, add **Required reviewers** and
+   name at least one person/team who must approve every run before
+   `deploy-production` (and `rollback-production`) execute.
+3. Add the secrets and variables below to the `production` Environment (not
+   repo-wide, so only an approved run of this workflow can read them):
+   - `PRODUCTION_KUBECONFIG` (secret, required) — base64-encoded kubeconfig
+     scoped to the production namespace.
+   - `PRODUCTION_DATABASE_URL` (variable, required) — only checked for
+     presence by `check-production-config`; the actual migration run reads
+     `DATABASE_URL` from `global.existingSecret` inside the cluster via the
+     Helm pre-upgrade hook Job, not from this variable directly.
+   - `PRODUCTION_API_KEY` (secret, optional) — used by the authenticated
+     `GET /v1/events` smoke test; the check is skipped (not failed) if unset.
+   - `PRODUCTION_URL` (variable, required for the smoke test stage) — public
+     URL of the production API. `smoke-test-production` is skipped entirely
+     when this is unset, same `check-staging-config`-style "skip is explicit,
+     not silent" posture as staging.
+   - `PRODUCTION_NAMESPACE` (variable, optional, defaults to `trident-prod`).
+   - `PRODUCTION_ALERT_WEBHOOK_URL` (secret, optional) — failure notification.
+
+Until the required-reviewers rule is configured, `environment: production`
+still scopes the secrets above to this workflow but does not pause for
+approval — the rule is what makes this an approval gate.
+
+### What the workflow does
+
+1. **`resolve-tag`** — picks the tag from whichever trigger fired.
+2. **`verify-images`** — confirms `release.yml` actually published every
+   image (`trident-indexer`, `trident-grpc-api`, `trident-go-api`,
+   `trident-migrate`) under that tag, so a failed or partial release fails
+   here with a clear message instead of a confusing `ImagePullBackOff` later.
+3. **`check-production-config`** — fails loudly (not a silent skip) if
+   `PRODUCTION_KUBECONFIG`/`PRODUCTION_DATABASE_URL` aren't configured, same
+   `check-staging-config` pattern (issue #395): a deploy that did not happen
+   must not report green.
+4. **`deploy-production`** — waits for Environment approval, then
+   `helm upgrade --install trident helm/trident -f values.yaml -f
+   values-prod.yaml --set *.image.tag=<the release tag>`. Migrations run
+   first because they're a Helm pre-upgrade hook Job
+   (`helm/trident/templates/migration-job.yaml`, `helm.sh/hook-weight: "-5"`)
+   — the same `helm upgrade` call blocks the app Deployments on it, no
+   separate migration step needed.
+5. **`smoke-test-production`** — health, readiness, an authenticated
+   `GET /v1/events` read, public `GET /v1/stats/indexer`, and an
+   invalid-key → `401` check against `PRODUCTION_URL`.
+6. **`rollback-production`** — on any failure above, `helm rollback trident
+   0` in the production namespace, then confirms the rolled-back
+   Deployments actually come back healthy. Per
+   [docs/ROLLBACK_RUNBOOK.md](./ROLLBACK_RUNBOOK.md), this covers an
+   additive schema change; a breaking migration still needs a human-reviewed
+   reverse script.
+7. **`alert-on-failure`** — posts to `PRODUCTION_ALERT_WEBHOOK_URL` if any
+   job above failed.
+
+### Deployment record
+
+Every run of `deploy-production` and `rollback-production` is recorded by
+GitHub's Deployments API because they declare `environment: production` —
+the triggering ref/sha, the reviewer(s) who approved and when, and the
+resulting status are all visible under the repo's **Environments** tab and
+the run's own Deployments sidebar, with no extra workflow code. That record
+is what answers "who approved this production deploy, and when" after the
+fact.

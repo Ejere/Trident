@@ -312,6 +312,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Require a pinned idempotency encryption key in production: unset, each
+	// replica generates its own random key and a retried create landing on a
+	// different replica can't decrypt the first attempt's record, which can
+	// double-create a resource (see idempotency.go).
+	if err := middleware.ValidateIdempotencyEncryptionConfig(); err != nil {
+		slog.Error("invalid idempotency encryption configuration", "err", err)
+		os.Exit(1)
+	}
+
 	// Shared tier cache so an admin tier change (PATCH /v1/api-keys/{id}) can
 	// evict the stale entry immediately instead of waiting for the TTL (#229).
 	tierCache := middleware.NewTierCache()

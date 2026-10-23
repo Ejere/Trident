@@ -1,19 +1,16 @@
 import type { SorobanEvent, ListEventsResponse, Network, IndexerStats } from "./types";
+import { getExplorerConfig } from "./env";
 
-const TESTNET_URL =
-  import.meta.env.TRIDENT_TESTNET_API_URL ?? "https://api.testnet.trident.dev";
-const MAINNET_URL =
-  import.meta.env.TRIDENT_MAINNET_API_URL ?? "https://api.mainnet.trident.dev";
-const API_KEY: string = import.meta.env.EXPLORER_API_KEY ?? "";
 export const API_TIMEOUT = 30000; // 30 second timeout
 
 function baseUrl(network: Network): string {
-  return network === "mainnet" ? MAINNET_URL : TESTNET_URL;
+  return getExplorerConfig().apiBaseUrl(network);
 }
 
-function authHeaders(): HeadersInit {
+function authHeaders(network: Network): HeadersInit {
   const h: Record<string, string> = {};
-  if (API_KEY) h["X-API-Key"] = API_KEY;
+  const key = getExplorerConfig().apiKeyFor(network);
+  if (key) h["X-API-Key"] = key;
   return h;
 }
 
@@ -110,7 +107,7 @@ export async function listEvents(
   if (params.cursor) url.searchParams.set("cursor", params.cursor);
   url.searchParams.set("limit", String(params.limit ?? 25));
 
-  return fetchJson<ListEventsResponse>(url.toString(), { headers: authHeaders() });
+  return fetchJson<ListEventsResponse>(url.toString(), { headers: authHeaders(network) });
 }
 
 export async function getEvent(
@@ -119,7 +116,7 @@ export async function getEvent(
 ): Promise<SorobanEvent> {
   const body = await fetchJson<{ event: SorobanEvent }>(
     `${baseUrl(network)}/v1/events/${encodeURIComponent(id)}`,
-    { headers: authHeaders() },
+    { headers: authHeaders(network) },
   );
   return body.event;
 }
@@ -137,12 +134,13 @@ export function streamUrl(network: Network, contractId: string, topic0 = ""): st
 }
 
 /** Base headers for streaming requests (server-side only). */
-export function streamHeaders(lastEventId?: string): HeadersInit {
+export function streamHeaders(network: Network, lastEventId?: string): HeadersInit {
   const h: Record<string, string> = {
     Accept: "text/event-stream",
     "Cache-Control": "no-cache",
   };
-  if (API_KEY) h["X-API-Key"] = API_KEY;
+  const key = getExplorerConfig().apiKeyFor(network);
+  if (key) h["X-API-Key"] = key;
   if (lastEventId) h["Last-Event-ID"] = lastEventId;
   return h;
 }

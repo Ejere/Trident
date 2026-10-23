@@ -372,8 +372,15 @@ where
 ///
 /// Keyed by the originating event's UUID, so replaying a page re-projects the
 /// same rows and `ON CONFLICT DO NOTHING` absorbs them.
+///
+/// `network` must match the value used for the events in the same page —
+/// previously left unbound, so every row fell back to the column's
+/// `DEFAULT 'testnet'` regardless of the indexer's actual network (issue #595
+/// fixed this for `soroban_events`/`contract_invocation_metrics` but missed
+/// this table).
 pub async fn insert_token_events_batch<'e, E>(
     executor: E,
+    network: &str,
     projections: &[TokenProjection<'_>],
 ) -> Result<(), TridentError>
 where
@@ -385,6 +392,7 @@ where
 
     let mut event_ids = Vec::with_capacity(projections.len());
     let mut contract_ids = Vec::with_capacity(projections.len());
+    let mut networks = Vec::with_capacity(projections.len());
     let mut event_types = Vec::with_capacity(projections.len());
     let mut from_addresses = Vec::with_capacity(projections.len());
     let mut to_addresses = Vec::with_capacity(projections.len());
@@ -408,6 +416,7 @@ where
 
         event_ids.push(event_uuid(&event.transaction_hash, event.raw_event_index));
         contract_ids.push(event.contract_id.clone());
+        networks.push(network.to_string());
         event_types.push(token.event_type.as_str().to_string());
         from_addresses.push(token.from.clone());
         to_addresses.push(token.to.clone());
@@ -426,21 +435,22 @@ where
     sqlx::query(
         r#"
         INSERT INTO token_events
-            (event_id, contract_id, event_type, from_address, to_address,
+            (event_id, contract_id, network, event_type, from_address, to_address,
              spender_address, admin_address, amount, expiration_ledger,
              asset_code, asset_issuer,
              ledger_sequence, ledger_timestamp, transaction_hash, event_index)
         SELECT * FROM UNNEST(
-            $1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[],
-            $6::text[], $7::text[], $8::text[], $9::bigint[],
-            $10::text[], $11::text[],
-            $12::bigint[], $13::timestamptz[], $14::text[], $15::int[]
+            $1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+            $7::text[], $8::text[], $9::text[], $10::bigint[],
+            $11::text[], $12::text[],
+            $13::bigint[], $14::timestamptz[], $15::text[], $16::int[]
         )
         ON CONFLICT (event_id) DO NOTHING
         "#,
     )
     .bind(&event_ids)
     .bind(&contract_ids)
+    .bind(&networks)
     .bind(&event_types)
     .bind(&from_addresses)
     .bind(&to_addresses)
@@ -819,7 +829,7 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     // insert inside the same transaction, so a token_events row can never exist
     // without its corresponding soroban_events row already committed.
     for chunk in commit.token_events.chunks(batch_size) {
-        insert_token_events_batch(&mut *tx, chunk).await?;
+        insert_token_events_batch(&mut *tx, commit.network, chunk).await?;
     }
 
     // Invocation metrics ride the same transaction as the page they were
@@ -2630,6 +2640,66 @@ mod tests {
 
         sqlx::query("DELETE FROM contract_invocation_metrics WHERE contract_id = $1")
             .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+    }
+
+    /// `insert_token_events_batch` is the omission issue #595 missed: it must
+    /// stamp its rows with the caller's actual network too, not fall back to
+    /// `token_events.network`'s `DEFAULT 'testnet'` — previously every mainnet
+    /// token event was silently tagged `testnet`.
+    #[tokio::test]
+    async fn insert_token_events_batch_tags_rows_with_the_given_network() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let event = make_event("CTOKENNETTAG_MAINNET", 99, 2);
+        let token = crate::parser::token_events::TokenEvent {
+            event_type: crate::parser::token_events::TokenEventType::Transfer,
+            from: Some("GFROM".to_string()),
+            to: Some("GTO".to_string()),
+            spender: None,
+            admin: None,
+            amount: Some("100".to_string()),
+            expiration_ledger: None,
+            asset_code: None,
+            asset_issuer: None,
+        };
+        let projection = TokenProjection {
+            event: &event,
+            token: &token,
+        };
+
+        sqlx::query("DELETE FROM token_events WHERE contract_id = $1")
+            .bind(&event.contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+
+        insert_token_events_batch(&pool, "mainnet", &[projection])
+            .await
+            .expect("insert failed");
+
+        let row: (String,) =
+            sqlx::query_as("SELECT network FROM token_events WHERE contract_id = $1")
+                .bind(&event.contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("select failed");
+        assert_eq!(row.0, "mainnet");
+
+        sqlx::query("DELETE FROM token_events WHERE contract_id = $1")
+            .bind(&event.contract_id)
             .execute(&pool)
             .await
             .expect("cleanup failed");

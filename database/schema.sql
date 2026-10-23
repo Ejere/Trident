@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     transaction_hash    TEXT        NOT NULL,
     event_index         INTEGER     NOT NULL,
     event_type          TEXT        NOT NULL CHECK (event_type IN ('contract', 'system', 'diagnostic')),
-    network             TEXT        NOT NULL DEFAULT 'testnet',
+    network             TEXT        NOT NULL,
     topics              JSONB       NOT NULL DEFAULT '[]',
     topic_0             TEXT        GENERATED ALWAYS AS (topics ->> 0) STORED,
     topic_1             TEXT        GENERATED ALWAYS AS (topics ->> 1) STORED,
@@ -266,7 +266,7 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     paused_at    TIMESTAMPTZ,
-    network      TEXT        NOT NULL DEFAULT 'testnet'
+    network      TEXT        NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -343,7 +343,7 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event_id ON webhook_deliveries
 CREATE TABLE IF NOT EXISTS token_events (
     event_id uuid NOT NULL,
     contract_id text NOT NULL,
-    network text DEFAULT 'testnet'::text NOT NULL,
+    network text NOT NULL,
     event_type text NOT NULL,
     from_address text,
     to_address text,
@@ -377,7 +377,7 @@ CREATE INDEX IF NOT EXISTS idx_token_events_type ON token_events USING btree (ev
 CREATE TABLE IF NOT EXISTS contract_invocation_metrics (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     contract_id text NOT NULL,
-    network text DEFAULT 'testnet'::text NOT NULL,
+    network text NOT NULL,
     transaction_hash text NOT NULL,
     ledger_sequence bigint NOT NULL,
     ledger_timestamp timestamp with time zone NOT NULL,

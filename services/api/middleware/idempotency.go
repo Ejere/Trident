@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -60,22 +61,29 @@ type idempotencyRecord struct {
 // compromise), not just the original caller.
 //
 // IDEMPOTENCY_ENCRYPTION_KEY (64 hex chars = 32 bytes) lets an operator pin
-// this across restarts, which matters if idempotency records need to survive
-// a redeploy. Left unset, a random key is generated at process startup:
-// records are still encrypted at rest, replay still works for the lifetime
-// of the process (the case #225 actually asks for — a client retrying after
-// a network blip, not across a redeploy), and a record written by a
-// previous process simply fails to decrypt and is treated as a miss — safe,
-// since the fingerprint check still runs on the fresh execution.
+// this across restarts and across replicas. That is not optional with more
+// than one replica: left unset, each process generates its own random key
+// at startup, so a retried create that lands on a different replica than the
+// first attempt (or the same replica after a restart) cannot decrypt the
+// first attempt's record, falls through to "cache entry unreadable;
+// re-executing", and mints a second credential — the exact double-create
+// #225 exists to prevent. ValidateIdempotencyEncryptionConfig enforces that
+// this is set in production; left unset outside production, a random key is
+// generated and a record written by a previous process simply fails to
+// decrypt and is treated as a miss.
 var idempotencyEncryptionKey = loadOrGenerateIdempotencyKey()
 
+// idempotencyPreviousEncryptionKey, when set via
+// IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS, is tried to decrypt a record that
+// idempotencyEncryptionKey can't — so rotating IDEMPOTENCY_ENCRYPTION_KEY
+// (move the old value here, set a freshly generated one as the new value)
+// does not strand records written under the old key for the rest of their
+// TTL. New records are always written under the current key only.
+var idempotencyPreviousEncryptionKey = loadIdempotencyKeyFromEnv("IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS")
+
 func loadOrGenerateIdempotencyKey() []byte {
-	if raw := os.Getenv("IDEMPOTENCY_ENCRYPTION_KEY"); raw != "" {
-		key, err := hex.DecodeString(raw)
-		if err == nil && len(key) == 32 {
-			return key
-		}
-		slog.Warn("IDEMPOTENCY_ENCRYPTION_KEY is not 64 hex characters (32 bytes); generating an ephemeral key instead")
+	if key := loadIdempotencyKeyFromEnv("IDEMPOTENCY_ENCRYPTION_KEY"); key != nil {
+		return key
 	}
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
@@ -85,6 +93,52 @@ func loadOrGenerateIdempotencyKey() []byte {
 		panic("idempotency: failed to generate encryption key: " + err.Error())
 	}
 	return key
+}
+
+// loadIdempotencyKeyFromEnv decodes a 32-byte AES-256 key from the named
+// env var, or returns nil (with a warning for a present-but-malformed value)
+// when it is unset or invalid.
+func loadIdempotencyKeyFromEnv(envVar string) []byte {
+	raw := os.Getenv(envVar)
+	if raw == "" {
+		return nil
+	}
+	key, err := decodeIdempotencyKey(raw)
+	if err != nil {
+		slog.Warn(envVar+" is not 64 hex characters (32 bytes); ignoring", "err", err)
+		return nil
+	}
+	return key
+}
+
+func decodeIdempotencyKey(raw string) ([]byte, error) {
+	key, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("key must decode to 32 bytes, got %d", len(key))
+	}
+	return key, nil
+}
+
+// ValidateIdempotencyEncryptionConfig fails startup in production when
+// IDEMPOTENCY_ENCRYPTION_KEY is unset or malformed. Call once at process
+// startup (after initLogger, alongside ValidateAllowedOrigins) and exit on a
+// non-nil error — see idempotencyEncryptionKey's doc comment for why an
+// unset key is unsafe with more than one replica.
+func ValidateIdempotencyEncryptionConfig() error {
+	if os.Getenv("APP_ENV") != "production" {
+		return nil
+	}
+	raw := os.Getenv("IDEMPOTENCY_ENCRYPTION_KEY")
+	if raw == "" {
+		return errors.New("IDEMPOTENCY_ENCRYPTION_KEY must be set in production: without it, each replica encrypts idempotency records under its own random key and cannot read another replica's (or its own post-restart) records, which can double-create a resource on retry")
+	}
+	if _, err := decodeIdempotencyKey(raw); err != nil {
+		return fmt.Errorf("IDEMPOTENCY_ENCRYPTION_KEY is invalid (%w); it must be 64 hex characters (32 bytes)", err)
+	}
+	return nil
 }
 
 // encryptIdempotencyPayload seals plaintext with AES-256-GCM under
@@ -105,12 +159,27 @@ func encryptIdempotencyPayload(plaintext []byte) ([]byte, error) {
 	return gcm.Seal(nonce, nonce, plaintext, nil), nil
 }
 
-// decryptIdempotencyPayload reverses encryptIdempotencyPayload. An error
-// here (wrong key, e.g. a record written by a previous process when no
-// fixed IDEMPOTENCY_ENCRYPTION_KEY is configured, or corruption) is treated
-// by callers as a cache miss, not a hard failure.
+// decryptIdempotencyPayload reverses encryptIdempotencyPayload, trying
+// idempotencyPreviousEncryptionKey (when configured) if the current key
+// fails — the overlap window that makes IDEMPOTENCY_ENCRYPTION_KEY rotatable
+// without losing in-flight records. An error from both (wrong key and no/
+// stale previous key configured, or corruption) is treated by callers as a
+// cache miss, not a hard failure.
 func decryptIdempotencyPayload(ciphertext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(idempotencyEncryptionKey)
+	plaintext, err := decryptIdempotencyPayloadWithKey(ciphertext, idempotencyEncryptionKey)
+	if err == nil {
+		return plaintext, nil
+	}
+	if idempotencyPreviousEncryptionKey != nil {
+		if plaintext, prevErr := decryptIdempotencyPayloadWithKey(ciphertext, idempotencyPreviousEncryptionKey); prevErr == nil {
+			return plaintext, nil
+		}
+	}
+	return nil, err
+}
+
+func decryptIdempotencyPayloadWithKey(ciphertext, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}

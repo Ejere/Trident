@@ -10,16 +10,26 @@ primary_region = "iad"
   LOG_LEVEL = "info"
   # Connect to gRPC API over Fly private network (6PN)
   GRPC_ADDR = "trident-grpc-api.internal:50051"
+  # Enables JSON structured logging (services/api/logging.go) and, since
+  # trident-api runs 2+ machines (see Scaling in docs/deployment.md), makes
+  # IDEMPOTENCY_ENCRYPTION_KEY required at startup
+  # (middleware.ValidateIdempotencyEncryptionConfig) instead of each machine
+  # silently generating its own per-process key.
+  APP_ENV   = "production"
 
 # Secrets are sourced exclusively from Fly's encrypted secrets store
 # (set via: fly secrets set -a trident-api KEY=value), never from [env].
 # Required: DATABASE_URL, REDIS_URL, API_KEY_SALT (services/api/middleware/auth.go
-# HMACs incoming keys with this), ADMIN_API_KEY (guards /v1/admin/*)
+# HMACs incoming keys with this), ADMIN_API_KEY (guards /v1/admin/*),
+# IDEMPOTENCY_ENCRYPTION_KEY (64 hex chars / 32 bytes — required because
+# APP_ENV=production above; see services/api/middleware/idempotency.go)
 # Required for the legacy env-var auth path: API_KEY_HASHES (skip only if all
 # API keys are issued through the DB-backed /v1/admin/keys flow instead)
 # Optional: NETWORK (label only, used by GET /v1/stats/contracts response),
 # STELLAR_RPC_URL (enables POST /v1/admin/contracts/{id}/call),
-# PGBOUNCER_ADMIN_URL (enables GET /v1/admin/db pool stats)
+# PGBOUNCER_ADMIN_URL (enables GET /v1/admin/db pool stats),
+# IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS (set only while rotating
+# IDEMPOTENCY_ENCRYPTION_KEY)
 
 [http_service]
   internal_port        = 3000

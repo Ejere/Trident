@@ -69,6 +69,25 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: API_KEY_SALT
+            # Required when APP_ENV=production (see goApi.env below) —
+            # services/api/middleware.ValidateIdempotencyEncryptionConfig
+            # fails startup without it. optional: true so a non-production
+            # install with no such key in existingSecret still starts (the
+            # app falls back to a random per-process key).
+            - name: IDEMPOTENCY_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: IDEMPOTENCY_ENCRYPTION_KEY
+                  optional: true
+            # Set only during a rotation of IDEMPOTENCY_ENCRYPTION_KEY — see
+            # global.externalSecret.data's comment on IDEMPOTENCY_ENCRYPTION_KEY.
+            - name: IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS
+                  optional: true
             {{- if .Values.internalMTLS.enabled }}
             # Behind a flag (issue #320): the Go API dials the gRPC server
             # with a client cert and verifies the server against

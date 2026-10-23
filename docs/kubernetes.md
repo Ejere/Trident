@@ -39,7 +39,8 @@ kubectl create secret generic trident-secrets \
   --from-literal=REDIS_URL="redis://redis-host:6379" \
   --from-literal=ADMIN_API_KEY="$(openssl rand -hex 32)" \
   --from-literal=API_KEY_SALT="$(openssl rand -hex 32)" \
-  --from-literal=STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
+  --from-literal=STELLAR_RPC_URL="https://soroban-testnet.stellar.org" \
+  --from-literal=IDEMPOTENCY_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 ```
 
 ### 3. Install the chart
@@ -409,8 +410,8 @@ curl -X POST "$TRIDENT_HOST/v1/api-keys" \
 
 Every deployment (and the migration hook Job — see
 [Database migrations](#migrations) above) reads its sensitive configuration,
-including `DATABASE_URL`, `REDIS_URL`, `ADMIN_API_KEY`, `API_KEY_SALT`, and
-`STELLAR_RPC_URL`, from a single Kubernetes Secret named by
+including `DATABASE_URL`, `REDIS_URL`, `ADMIN_API_KEY`, `API_KEY_SALT`,
+`STELLAR_RPC_URL`, and `IDEMPOTENCY_ENCRYPTION_KEY`, from a single Kubernetes Secret named by
 `global.existingSecret` (default `trident-secrets`) via `secretKeyRef` —
 never from `values.yaml`, and never `COPY`'d into an image layer (see
 [crates/api/Dockerfile](../crates/api/Dockerfile),
@@ -421,6 +422,21 @@ binary (or, for `database/Dockerfile`, the `sqlx` CLI and the migration
 `.sql` files) out of its builder stage — no `.env` file, no secret, is ever
 part of an image layer). How that one Secret gets *populated* is a separate
 choice, with three supported options:
+
+`IDEMPOTENCY_ENCRYPTION_KEY` (64 hex characters / 32 bytes, e.g.
+`openssl rand -hex 32`) is required specifically because `go-api` runs 2+
+replicas by default (`goApi.replicaCount`, autoscaled up to
+`goApi.hpa.maxReplicas`): without a shared key, each replica encrypts
+idempotency records (see `services/api/middleware/idempotency.go`) under its
+own randomly generated key, so a retried `POST /v1/api-keys` or
+`POST /v1/webhooks` that lands on a different replica than the first attempt
+can't decrypt that replica's record and mints a second credential.
+`values-prod.yaml` sets `APP_ENV=production`, which makes the Go API refuse
+to start if this key is missing from the Secret — populate it before
+installing with that overlay. See
+[Rotating `IDEMPOTENCY_ENCRYPTION_KEY`](./deployment.md#rotating-idempotency_encryption_key)
+to rotate it without downtime via the optional
+`IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` key in the same Secret.
 
 ### Option 1 — `kubectl create secret` (quick start / dev)
 

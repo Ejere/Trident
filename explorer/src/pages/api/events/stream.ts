@@ -27,7 +27,7 @@ export const GET: APIRoute = async ({ url, request }) => {
   let upstream: Response;
   try {
     upstream = await fetch(streamUrl(network, contractId, topic0), {
-      headers: streamHeaders(lastEventId),
+      headers: streamHeaders(network, lastEventId),
     });
   } catch {
     return new Response(

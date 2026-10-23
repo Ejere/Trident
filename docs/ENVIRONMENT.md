@@ -168,7 +168,8 @@ guessing would silently derive wrong SAC contract ids.
 | `PPROF_ENABLED` | Optional | `false` | Enables the internal-only pprof profiling server. Never exposed publicly — bind it to loopback/localhost only. |
 | `PPROF_ADDR` | Optional | `127.0.0.1:6060` | Bind address for the pprof server, when enabled. |
 | `GRPC_MTLS_ENABLED` / `GRPC_MTLS_CA_CERT` / `GRPC_MTLS_CLIENT_CERT` / `GRPC_MTLS_CLIENT_KEY` | Optional (see grpc-api section) | — | Client-side counterpart of the grpc-api mTLS flag (issue #320); `services/api/grpc/client.go`. |
-| `IDEMPOTENCY_ENCRYPTION_KEY` | Optional | random key generated at startup | 64 hex characters (32 bytes), AES-256 key used to encrypt idempotency records at rest in Redis (issue #572) — `POST /v1/api-keys` and `POST /v1/webhooks` return a live credential in their body, and `middleware.Idempotency` stores that body for `DefaultIdempotencyTTL` (24h). Left unset, a random key is generated per process: records are still encrypted, but a record written before a restart cannot be decrypted afterward and is treated as a cache miss (safe — the request is just re-executed). Set this if idempotency replay must survive a redeploy. |
+| `IDEMPOTENCY_ENCRYPTION_KEY` | Required when `APP_ENV=production` | random key generated at startup | 64 hex characters (32 bytes), AES-256 key used to encrypt idempotency records at rest in Redis (issue #572) — `POST /v1/api-keys` and `POST /v1/webhooks` return a live credential in their body, and `middleware.Idempotency` stores that body for `DefaultIdempotencyTTL` (24h). `middleware.ValidateIdempotencyEncryptionConfig` refuses to start the API when `APP_ENV=production` and this is unset or malformed: with more than one replica, each replica otherwise generates its own random key and can't decrypt another replica's record, which can double-create a resource on retry. Outside production, left unset, a random key is generated per process (records then don't survive a restart). |
+| `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` | Optional | unset | Set only while rotating `IDEMPOTENCY_ENCRYPTION_KEY` — decrypt falls back to this key for records written under it before the rotation, so they still decrypt during the overlap window. See docs/deployment.md#rotating-idempotency_encryption_key. |
 
 ## Docker Compose only
 
@@ -176,7 +177,7 @@ guessing would silently derive wrong SAC contract ids.
 |---|---|---|---|
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Optional (compose only) | `trident` / `password` / `trident` | Postgres container bootstrap credentials. |
 | `LOG_LEVEL` | Optional | `info` | Go API log verbosity (`.env.ci`/compose convenience; not read directly by Rust services, which use `RUST_LOG`). |
-| `APP_ENV` | Optional | unset | Go API log *format*, not verbosity. `production` emits JSON for log aggregation; anything else (including unset) emits human-readable text. Pair with `LOG_LEVEL`, which controls the threshold. |
+| `APP_ENV` | Required in production | unset | Go API log *format*, not verbosity. `production` emits JSON for log aggregation; anything else (including unset) emits human-readable text. Pair with `LOG_LEVEL`, which controls the threshold. Also gates `IDEMPOTENCY_ENCRYPTION_KEY`'s startup check above — set `production` and the API refuses to start without that key configured. |
 
 ## Production secret inventory
 
@@ -194,6 +195,7 @@ passed as Docker build arguments, or printed in logs.
 | `INTERNAL_API_KEY` | Required when `/internal/status` is used. | At least 32 cryptographically random bytes, encoded as hex or base64. | External Secrets backend / Fly secrets | Platform/SRE owner |
 | Raw API keys, including `STAGING_API_KEY` | Authenticate API clients and the staging smoke test. | At least 32 cryptographically random bytes; store only the raw client copy and the server-side HMAC/hash. | DB-backed key issuer; staging copy in GitHub Environment secrets | API service owner |
 | `API_KEY_SALT` | Required in production to HMAC API keys; the built-in development value is forbidden. | 32 random bytes encoded as 64 lowercase hex characters. | External Secrets backend / Fly secrets | Security owner |
+| `IDEMPOTENCY_ENCRYPTION_KEY` / `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` | Former required when `APP_ENV=production` (startup fails otherwise); latter set only mid-rotation. Encrypts idempotency records and lets every Go API replica decrypt records any other replica wrote. | 32 random bytes encoded as 64 lowercase hex characters. | External Secrets backend / Fly secrets | Security owner |
 | `API_KEY_HASHES` | Required only for the legacy environment-backed key path. | Comma-separated lowercase 64-character HMAC-SHA256 digests. | External Secrets backend / Fly secrets | API service owner |
 | `PGBOUNCER_ADMIN_URL` | Required only for the admin pool-stat endpoint; carries PgBouncer credentials. | PostgreSQL URI for the PgBouncer admin database. | External Secrets backend / Fly secrets | Database/SRE owner |
 | `ALERT_WEBHOOK_URL` / `STAGING_ALERT_WEBHOOK_URL` | Optional alert destinations; webhook URLs commonly contain bearer tokens. | Provider-issued HTTPS webhook URL. | External Secrets/Fly secrets; GitHub Environment secret for staging | Observability/SRE owner |
@@ -201,6 +203,7 @@ passed as Docker build arguments, or printed in logs.
 | `INTERNAL_SERVER_KEY` / `INTERNAL_CLIENT_KEY` | Required when internal gRPC mTLS is enabled. | Unencrypted PKCS#8 PEM private keys, readable only by the workload identity. | External Secrets backend or cert-manager-managed Kubernetes Secret | Security/PKI owner |
 | `INTERNAL_CA_CERT`, `INTERNAL_SERVER_CERT`, `INTERNAL_CLIENT_CERT` | Required with internal gRPC mTLS. Certificates are public material but are managed with their private keys. | PEM-encoded X.509 certificate/bundle with SANs matching service DNS names. | External Secrets backend or cert-manager-managed Kubernetes Secret | Security/PKI owner |
 | `STAGING_KUBECONFIG` | Required for the staging deployment workflow. | Base64 of a minimal kubeconfig scoped to the staging namespace. | GitHub `staging` Environment secret | Platform/SRE owner |
+| `PRODUCTION_KUBECONFIG` | Required for the production deployment workflow. | Base64 of a minimal kubeconfig scoped to the production namespace. | GitHub `production` Environment secret | Platform/SRE owner |
 | `NPM_TOKEN` | Required by SDK publishing workflows. | npm automation or granular access token limited to the Trident package scope. | GitHub release Environment secret | Release engineering owner |
 | `GITHUB_TOKEN` | Required for GHCR, releases, and security tooling; issued automatically per job. | GitHub-generated ephemeral token with job-minimal permissions. | GitHub Actions automatic token | Repository administrators |
 

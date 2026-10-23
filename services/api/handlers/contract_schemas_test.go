@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -22,6 +23,13 @@ type mockSchemaDB struct {
 	observedTopics    []string
 	sampleDataByEvent map[string][]byte
 	execCalls         int
+	// tokenEventsNetworkArgs records the network argument passed to every
+	// "FROM token_events" query, so a test can assert the handler queries
+	// the caller's actual network rather than always "testnet" (issue #595
+	// follow-up: token_events.network was never bound on insert, so the
+	// mainnet view silently had nothing to return even though the query
+	// here was always correctly scoped).
+	tokenEventsNetworkArgs []string
 }
 
 func (m *mockSchemaDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
@@ -43,9 +51,14 @@ func (m *mockSchemaDB) QueryRow(_ context.Context, sql string, args ...any) pgx.
 	}
 }
 
-func (m *mockSchemaDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+func (m *mockSchemaDB) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	switch {
 	case strings.Contains(sql, "FROM token_events"):
+		if len(args) > 1 {
+			if network, ok := args[1].(string); ok {
+				m.tokenEventsNetworkArgs = append(m.tokenEventsNetworkArgs, network)
+			}
+		}
 		rows := make([][]any, 0, len(m.tokenEventTypes))
 		for _, eventName := range m.tokenEventTypes {
 			rows = append(rows, []any{eventName})
@@ -221,4 +234,53 @@ func TestContractEventSchemas_ReturnsObservedSchemasAndPersistsRegistry(t *testi
 	assertFieldNames("transfer", []string{"amount", "from", "to"})
 	assertFieldNames("set_authorized", []string{"admin", "authorize", "id"})
 	assertFieldNames("custom_event", []string{"enabled", "message"})
+}
+
+// TestContractEventSchemas_MainnetKey_QueriesMainnetTokenEvents guards
+// against the regression this fixes: token_events.network was never bound
+// on insert, so every row defaulted to 'testnet' and a mainnet request here
+// would scope its token_events query to "mainnet" and get nothing back. The
+// handler's query scoping was always correct — this asserts it stays that
+// way and returns the token event types for the requested network.
+func TestContractEventSchemas_MainnetKey_QueriesMainnetTokenEvents(t *testing.T) {
+	db := &mockSchemaDB{
+		codeHash:        "wasm-hash-456",
+		tokenEventTypes: []string{"mint", "transfer"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/contracts/"+validSchemaContractID+"/events/schema", nil)
+	req.SetPathValue("id", validSchemaContractID)
+	req = req.WithContext(middleware.WithNetwork(req.Context(), "mainnet"))
+	rec := httptest.NewRecorder()
+
+	ContractEventSchemas(db).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp ContractEventSchemaResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Network != "mainnet" {
+		t.Fatalf("network: got %q, want mainnet", resp.Network)
+	}
+
+	for _, network := range db.tokenEventsNetworkArgs {
+		if network != "mainnet" {
+			t.Fatalf("token_events query scoped to %q, want mainnet", network)
+		}
+	}
+	if len(db.tokenEventsNetworkArgs) == 0 {
+		t.Fatal("expected the token_events query to run with a network argument")
+	}
+
+	gotTypes := make(map[string]bool)
+	for _, event := range resp.Events {
+		gotTypes[event.EventName] = true
+	}
+	if !gotTypes["mint"] || !gotTypes["transfer"] {
+		t.Fatalf("expected mint and transfer token event types for mainnet, got %v", resp.Events)
+	}
 }

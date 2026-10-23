@@ -1,0 +1,380 @@
+name: Production Deploy
+
+# Promotes a published GitHub Release to production. Until this workflow,
+# mainnet go-live and every later update was a manual `helm upgrade` run from
+# someone's laptop: no recorded approver, no post-deploy smoke test gate
+# (#396 covered staging only), and no automatic rollback on failure (#621
+# covered staging only).
+#
+# Triggers:
+#   - release: published  -- fires automatically when release.yml finishes
+#     building images for a `v*.*.*` tag and creates the GitHub Release.
+#   - workflow_dispatch   -- promote a specific already-published tag by
+#     hand (e.g. retrying a promotion after a transient smoke-test failure,
+#     without cutting a new release).
+#
+# Approval gate: deploy-production (and rollback-production) run under the
+# "production" GitHub Environment. That Environment must be configured once,
+# by a repo admin, with required reviewers (Settings -> Environments ->
+# production -> Required reviewers) -- this workflow file cannot create that
+# protection rule itself, only use it. Until it's configured, `environment:
+# production` still scopes secrets but does not pause for approval. See
+# docs/deployment.md#production for the one-time setup and the full
+# promotion runbook.
+#
+# Same migration-then-rollout order as staging-deploy.yml: migrations run as
+# a Helm pre-upgrade hook Job (helm/trident/templates/migration-job.yaml,
+# helm.sh/hook-weight: "-5"), applied before any Deployment rolls out, as
+# part of the `helm upgrade --install` step below -- no separate migration
+# step is needed here.
+#
+# Deployment record: any job that declares `environment: production` is
+# recorded by GitHub's Deployments API automatically -- the ref/sha, the
+# approver(s) and when they approved, and the resulting status, all visible
+# under the repo's Environments / Deployments UI. No extra API calls are
+# needed in this workflow for the "who/what/when" record.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to deploy (e.g. v1.4.0). Must already be published by release.yml."
+        required: true
+        type: string
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  ORG: telocel-labs
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the tag to deploy from whichever trigger fired, so every
+  # downstream job references one unambiguous value instead of re-deriving it
+  # from two different event shapes.
+  # ---------------------------------------------------------------------------
+  resolve-tag:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG="${RELEASE_TAG:-$DISPATCH_TAG}"
+          if [ -z "$TAG" ]; then
+            echo "::error::No release tag resolved from this trigger"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "## Deploying \`$TAG\` to production" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Confirm every image release.yml publishes under this tag actually exists
+  # before attempting to deploy it. A mistyped workflow_dispatch tag, or a
+  # release whose build-and-push jobs failed partway, fails here with a clear
+  # message instead of surfacing later as a confusing ImagePullBackOff.
+  # ---------------------------------------------------------------------------
+  verify-images:
+    name: Verify release images exist
+    runs-on: ubuntu-latest
+    needs: resolve-tag
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20 # v3.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify every release image is published
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          for image in trident-indexer trident-grpc-api trident-go-api trident-migrate; do
+            ref="${{ env.REGISTRY }}/${{ env.ORG }}/${image}:${TAG}"
+            echo "::group::Checking ${ref}"
+            if ! docker buildx imagetools inspect "$ref" > /dev/null; then
+              echo "::error::Image ${ref} not found -- did release.yml finish successfully for ${TAG}?"
+              exit 1
+            fi
+            echo "✓ ${ref} exists"
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  # Check required production deploy credentials are configured, same
+  # fail-loud pattern as staging-deploy.yml's check-staging-config (issue
+  # #395): a deploy that did not happen must not report green.
+  # ---------------------------------------------------------------------------
+  check-production-config:
+    name: Check production secrets are configured
+    runs-on: ubuntu-latest
+    needs: verify-images
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          HAS_KUBECONFIG: ${{ secrets.PRODUCTION_KUBECONFIG != '' }}
+          HAS_DATABASE_URL: ${{ vars.PRODUCTION_DATABASE_URL != '' }}
+        run: |
+          missing=()
+
+          if [ "$HAS_KUBECONFIG" != "true" ]; then
+            missing+=("PRODUCTION_KUBECONFIG (secret)")
+          fi
+
+          if [ "$HAS_DATABASE_URL" != "true" ]; then
+            missing+=("PRODUCTION_DATABASE_URL (variable)")
+          fi
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Required production credentials are missing: ${missing[*]}"
+            echo "::error::Add them under Settings → Secrets and variables → Actions. See docs/deployment.md#production."
+            echo "Production deploy FAILED: missing ${missing[*]}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+          echo "✓ All required production secrets are configured"
+          echo "Production deploy PROCEEDING: all required credentials present" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Deploy to production via Helm. Gated by the "production" Environment's
+  # required reviewers (see the workflow-level comment above) -- this job
+  # waits for an approval in the Actions run UI before anything below
+  # executes.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: [resolve-tag, check-production-config]
+    if: needs.check-production-config.outputs.configured == 'true'
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Helm
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: "3.14.0"
+
+      - name: Configure kubeconfig
+        env:
+          PRODUCTION_KUBECONFIG: ${{ secrets.PRODUCTION_KUBECONFIG }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$PRODUCTION_KUBECONFIG" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Helm upgrade --install
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          helm upgrade --install trident helm/trident \
+            -f helm/trident/values.yaml \
+            -f helm/trident/values-prod.yaml \
+            --namespace "${{ vars.PRODUCTION_NAMESPACE || 'trident-prod' }}" \
+            --create-namespace \
+            --set indexer.image.tag="${TAG}" \
+            --set grpcApi.image.tag="${TAG}" \
+            --set goApi.image.tag="${TAG}" \
+            --wait --timeout 10m
+
+  # ---------------------------------------------------------------------------
+  # Post-deploy smoke test suite that gates the production rollout, same
+  # acceptance criteria #396 established for staging: health, readiness, an
+  # authenticated read, and public stats, plus the stream/auth-rejection
+  # checks staging-deploy.yml added since. A failing smoke test here triggers
+  # rollback-production below instead of leaving a bad release serving.
+  # ---------------------------------------------------------------------------
+  smoke-test-production:
+    name: Smoke test production
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: vars.PRODUCTION_URL != ''
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # curl's --retry only covers failures it deems transient (refused
+      # connections, timeouts, 5xx), so it gives up immediately on exit 56 --
+      # a connection accepted and then reset, which is exactly what a rolling
+      # deployment produces. An explicit loop retries on any failure,
+      # matching staging-deploy.yml and the e2e health checks in ci.yml.
+      - name: Smoke test - GET /health
+        run: |
+          echo "::group::Testing /health endpoint"
+          for attempt in $(seq 1 20); do
+            if curl --silent --fail --max-time 10 "${{ vars.PRODUCTION_URL }}/health"; then
+              echo "✓ /health returned 200 OK (attempt $attempt)"
+              echo "::endgroup::"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::endgroup::"
+          echo "::error::Smoke test failed: /health did not return 200 within 100s"
+          exit 1
+
+      - name: Smoke test - GET /v1/ready
+        run: |
+          echo "::group::Testing /v1/ready endpoint"
+          for attempt in $(seq 1 10); do
+            if curl --silent --fail --max-time 10 "${{ vars.PRODUCTION_URL }}/v1/ready"; then
+              echo "✓ /v1/ready returned 200 OK (attempt $attempt)"
+              echo "::endgroup::"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::endgroup::"
+          echo "::error::Smoke test failed: /v1/ready did not return 200 within 30s"
+          exit 1
+
+      - name: Smoke test - GET /v1/events (authenticated)
+        env:
+          PRODUCTION_API_KEY: ${{ secrets.PRODUCTION_API_KEY }}
+        run: |
+          echo "::group::Testing authenticated GET /v1/events"
+          response=$(curl --silent --fail --max-time 10 \
+            -H "X-API-Key: ${PRODUCTION_API_KEY}" \
+            "${{ vars.PRODUCTION_URL }}/v1/events?limit=1&network=mainnet")
+
+          echo "$response" | python3 -c "import sys,json; json.load(sys.stdin); print('✓ /v1/events returned valid JSON with authentication')"
+          echo "::endgroup::"
+
+      - name: Smoke test - GET /v1/stats/indexer
+        run: |
+          echo "::group::Testing /v1/stats/indexer endpoint"
+          response=$(curl --silent --fail --max-time 10 \
+            "${{ vars.PRODUCTION_URL }}/v1/stats/indexer?network=mainnet")
+
+          echo "$response" | python3 -c "import sys,json; data=json.load(sys.stdin); print('✓ /v1/stats/indexer returned valid JSON'); print(f'  Indexer stats: {data}')"
+          echo "::endgroup::"
+
+      - name: Additional validation - Error path (invalid API key -> 401)
+        run: |
+          echo "::group::Testing authentication rejection"
+          status=$(curl --silent -o /dev/null -w '%{http_code}' --max-time 10 \
+            -H "X-API-Key: definitely-not-a-valid-key" \
+            "${{ vars.PRODUCTION_URL }}/v1/events?limit=1")
+          if [ "$status" != "401" ]; then
+            echo "::error::Expected 401 for invalid API key, got $status"
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "✓ Invalid API key correctly rejected with 401"
+          echo "::endgroup::"
+
+      - name: Smoke test summary
+        if: success()
+        run: |
+          echo "::notice::✓ All smoke tests passed - production deployment is healthy"
+
+  # ---------------------------------------------------------------------------
+  # Automatic rollback on a failed production deploy or smoke test, same
+  # procedure #621 added for staging. Rolls back only the Helm release
+  # (previous image tags and chart values) to the prior revision -- per
+  # docs/ROLLBACK_RUNBOOK.md, safe when the schema change (if any) in the
+  # failed release is additive, and not a substitute for a reviewed reverse
+  # migration when it isn't; that judgment still needs a human.
+  #
+  # Gated on configured == 'true' the same way deploy-production is, so this
+  # never runs against a cluster this workflow was never able to reach.
+  # Runs under the "production" Environment too: a rollback is itself a
+  # production-affecting action and gets its own recorded deployment entry.
+  # ---------------------------------------------------------------------------
+  rollback-production:
+    name: Roll back production deploy
+    runs-on: ubuntu-latest
+    needs: [check-production-config, deploy-production, smoke-test-production]
+    if: failure() && needs.check-production-config.outputs.configured == 'true'
+    environment: production
+    steps:
+      - name: Set up Helm
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: "3.14.0"
+
+      - name: Configure kubeconfig
+        env:
+          PRODUCTION_KUBECONFIG: ${{ secrets.PRODUCTION_KUBECONFIG }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$PRODUCTION_KUBECONFIG" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Roll back to previous release
+        id: rollback
+        run: |
+          namespace="${{ vars.PRODUCTION_NAMESPACE || 'trident-prod' }}"
+
+          # Nothing to roll back to on a release's first-ever install: helm
+          # history has only one revision, and "rolling back" to it is a
+          # no-op that would still report success and mask the real failure.
+          revision_count=$(helm history trident -n "$namespace" -o json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          if [ "$revision_count" -lt 2 ]; then
+            echo "::warning::Only $revision_count Helm revision(s) exist for trident; nothing to roll back to. Manual intervention required, see docs/ROLLBACK_RUNBOOK.md."
+            echo "rolled_back=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          start_time=$(date +%s)
+          helm rollback trident 0 -n "$namespace" --wait --timeout 10m
+          end_time=$(date +%s)
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "duration_seconds=$((end_time - start_time))" >> "$GITHUB_OUTPUT"
+          echo "Automatic rollback completed in $((end_time - start_time))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify rolled-back deployment is serving
+        if: steps.rollback.outputs.rolled_back == 'true'
+        run: |
+          namespace="${{ vars.PRODUCTION_NAMESPACE || 'trident-prod' }}"
+          kubectl rollout status deployment -l app.kubernetes.io/component=go-api -n "$namespace" --timeout=120s
+          kubectl rollout status deployment -l app.kubernetes.io/component=grpc-api -n "$namespace" --timeout=120s
+          kubectl rollout status deployment -l app.kubernetes.io/component=indexer -n "$namespace" --timeout=120s
+
+  # ---------------------------------------------------------------------------
+  # Alert on a failed production deploy/smoke test. Reuses the same webhook
+  # convention as staging-deploy.yml's alert-on-failure, under its own
+  # PRODUCTION_ALERT_WEBHOOK_URL secret.
+  # ---------------------------------------------------------------------------
+  alert-on-failure:
+    name: Alert on production failure
+    runs-on: ubuntu-latest
+    needs: [resolve-tag, deploy-production, smoke-test-production, rollback-production]
+    if: failure()
+    steps:
+      - name: POST failure notification
+        env:
+          PRODUCTION_ALERT_WEBHOOK_URL: ${{ secrets.PRODUCTION_ALERT_WEBHOOK_URL }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+          ROLLED_BACK: ${{ needs.rollback-production.result == 'success' }}
+        run: |
+          if [ -z "$PRODUCTION_ALERT_WEBHOOK_URL" ]; then
+            echo "PRODUCTION_ALERT_WEBHOOK_URL is not configured; skipping notification"
+            exit 0
+          fi
+          if [ "$ROLLED_BACK" = "true" ]; then
+            text="Trident production deploy/smoke test failed for ${TAG}; automatic rollback ran."
+          else
+            text="Trident production deploy/smoke test failed for ${TAG}."
+          fi
+          curl --silent --fail --max-time 10 -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"$text\"}" \
+            "$PRODUCTION_ALERT_WEBHOOK_URL"

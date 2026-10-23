@@ -6,7 +6,12 @@
 global:
   # Name of a pre-existing Secret that holds sensitive env vars.
   # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY, API_KEY_SALT,
-  # STELLAR_RPC_URL. Production values files contain references only; the
+  # STELLAR_RPC_URL, IDEMPOTENCY_ENCRYPTION_KEY (64 hex chars / 32 bytes —
+  # the go-api deployment fails startup without it when APP_ENV=production;
+  # see services/api/middleware/idempotency.go). Optional:
+  # IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS, set only while rotating
+  # IDEMPOTENCY_ENCRYPTION_KEY (see docs/kubernetes.md#secrets).
+  # Production values files contain references only; the
   # values themselves live in the external backend configured below.
   #
   # This name is also the *target* Secret when externalSecret.enabled is
@@ -37,8 +42,8 @@ global:
       kind: ClusterSecretStore
     refreshInterval: 1h
     # Maps each key the chart's Secret needs (DATABASE_URL, REDIS_URL,
-    # ADMIN_API_KEY, API_KEY_SALT, STELLAR_RPC_URL) to its path in the backend.
-    # Defaults assume a
+    # ADMIN_API_KEY, API_KEY_SALT, STELLAR_RPC_URL, IDEMPOTENCY_ENCRYPTION_KEY)
+    # to its path in the backend. Defaults assume a
     # single JSON/KV secret at "trident/prod" with matching keys —
     # override remoteRef.key / .property per backend layout.
     data:
@@ -62,6 +67,19 @@ global:
         remoteRef:
           key: trident/prod
           property: STELLAR_RPC_URL
+      - secretKey: IDEMPOTENCY_ENCRYPTION_KEY
+        remoteRef:
+          key: trident/prod
+          property: IDEMPOTENCY_ENCRYPTION_KEY
+    # To rotate IDEMPOTENCY_ENCRYPTION_KEY: add a second entry here —
+    #   - secretKey: IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS
+    #     remoteRef: { key: trident/prod, property: IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS }
+    # — set that backend property to the *old* key's value, set
+    # IDEMPOTENCY_ENCRYPTION_KEY's backend property to a freshly generated
+    # key, and roll the deployment. Remove both the entry and the backend
+    # property once the old key's idempotency records have all expired
+    # (TTL is 24h by default), so a stale key doesn't linger as an unused
+    # decrypt path.
 
 # ---------------------------------------------------------------------------
 # Database migrations (issue #308) — runs as a Helm pre-install/pre-upgrade
